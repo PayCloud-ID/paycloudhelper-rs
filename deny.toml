@@ -1,0 +1,38 @@
+# cargo-deny config — gates every crate (RS-03 supply-chain).
+[advisories]
+version = 2
+yanked = "deny"
+ignore = [
+    { id = "RUSTSEC-2023-0071", reason = "No patched rsa release exists; required directly for the frozen SNAP-BI RSA contract and transitively by sqlx-mysql. Track upstream and remove this exception as soon as a fixed release is available." },
+    { id = "RUSTSEC-2024-0384", reason = "instant is unmaintained and has no patched release; it is transitively required by lapin 2.x. Track the AMQP stack upgrade and remove this exception when lapin no longer resolves instant." },
+    { id = "RUSTSEC-2025-0134", reason = "rustls-pemfile is unmaintained and has no patched release; it is transitively required by tonic/lapin. Track both upstream stacks and remove this exception when possible." },
+]
+
+[licenses]
+version = 2
+# The workspace itself is proprietary (LicenseRef-proprietary); third-party deps
+# must be permissively licensed.
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Unicode-3.0",
+    "Zlib",
+    "CDLA-Permissive-2.0",
+    "LicenseRef-proprietary",
+]
+confidence-threshold = 0.9
+private = { ignore = true }
+
+[bans]
+multiple-versions = "warn"
+wildcards = "warn"
+allow-wildcard-paths = true
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "warn"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]

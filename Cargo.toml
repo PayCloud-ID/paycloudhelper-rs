@@ -1,0 +1,93 @@
+[workspace]
+resolver = "2"
+members = ["crates/*"]
+
+[workspace.package]
+version = "0.1.0"                # shared pre-1.0 version (design 02 §4.1)
+edition = "2021"
+rust-version = "1.88"           # MSRV; required by the patched time dependency
+license = "LicenseRef-proprietary"
+repository = "https://github.com/PayCloud-ID/paycloudhelper-rs"
+
+[workspace.dependencies]
+# ---- internal crates (path deps; consumers override with git tag) ----
+pc-core = { path = "crates/pc-core", version = "0.1.0" }
+pc-config = { path = "crates/pc-config", version = "0.1.0" }
+pc-log = { path = "crates/pc-log", version = "0.1.0" }
+pc-trace = { path = "crates/pc-trace", version = "0.1.0" }
+pc-sentry = { path = "crates/pc-sentry", version = "0.1.0" }
+pc-json = { path = "crates/pc-json", version = "0.1.0" }
+pc-validate = { path = "crates/pc-validate", version = "0.1.0" }
+pc-resilience = { path = "crates/pc-resilience", version = "0.1.0" }
+pc-redis = { path = "crates/pc-redis", version = "0.1.0" }
+pc-db = { path = "crates/pc-db", version = "0.1.0" }
+pc-amqp = { path = "crates/pc-amqp", version = "0.1.0" }
+pc-audit = { path = "crates/pc-audit", version = "0.1.0" }
+pc-snapbi = { path = "crates/pc-snapbi", version = "0.1.0" }
+pc-http = { path = "crates/pc-http", version = "0.1.0" }
+pc-grpc = { path = "crates/pc-grpc", version = "0.1.0" }
+pc-auth = { path = "crates/pc-auth", version = "0.1.0" }
+pc-health = { path = "crates/pc-health", version = "0.1.0" }
+pc-s3minio = { path = "crates/pc-s3minio", version = "0.1.0" }
+
+# ---- third-party (single source of versions; design 03 PC-0) ----
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["preserve_order"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "signal"] }
+time = { version = "0.3.47", features = ["formatting", "local-offset", "macros"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json", "time"] }
+thiserror = "2"
+anyhow = "1"
+dotenvy = "0.15"
+uuid = { version = "1", features = ["v4", "v7"] }
+governor = "0.7"
+futures = "0.3"
+async-trait = "0.1"
+opentelemetry = { version = "0.27", features = ["trace", "metrics"] }
+opentelemetry-otlp = { version = "0.27", features = ["grpc-tonic", "trace", "metrics"] }
+opentelemetry_sdk = { version = "0.27", features = ["rt-tokio", "trace", "metrics"] }
+opentelemetry-semantic-conventions = "0.27"
+sentry = { version = "0.34", default-features = false, features = ["backtrace", "contexts", "panic"] }
+redis = { version = "0.27", features = ["tokio-comp", "connection-manager"] }
+deadpool-redis = "0.18"
+rslock = { version = "0.6", default-features = false, features = ["tokio-comp"] }
+lapin = "2"
+deadpool-lapin = "0.12"
+sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "postgres", "mysql"] }
+axum = "0.7"
+tower = { version = "0.5", features = ["util", "timeout", "load-shed", "limit"] }
+tower-http = { version = "0.6", features = ["timeout", "limit", "request-id", "set-header", "trace"] }
+tonic = { version = "0.12", features = ["tls"] }
+moka = { version = "0.12", features = ["future"] }
+dashmap = "6"
+reqwest = { version = "0.12", default-features = false, features = ["json", "multipart", "rustls-tls"] }
+# crypto (pc-snapbi)
+hmac = "0.12"
+sha2 = "0.10"
+rsa = { version = "0.9", features = ["sha2"] }
+aes-gcm = "0.10"
+pkcs1 = "0.7"
+pkcs8 = "0.10"
+pem = "3"
+base64 = "0.22"
+jsonwebtoken = "9"
+md-5 = "0.10"
+subtle = "2"
+regex = "1"
+rand = "0.8"
+hex = "0.4"
+# test-only
+mockito = "1"
+
+[workspace.lints.clippy]
+all = { level = "warn", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
+# noise reducers for a parity-focused library
+module_name_repetitions = "allow"
+missing_errors_doc = "allow"
+missing_panics_doc = "allow"
+must_use_candidate = "allow"
+# docs are dense with product/proper nouns (PayCloud, JsonMinify, RabbitMQ,
+# SNAP-BI, …) and Go symbol names — backtick-escaping every one is noise.
+doc_markdown = "allow"

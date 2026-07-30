@@ -1,0 +1,21 @@
+{
+  "oracle": "Go encoding/json.Compact (same primitive used by paycloudhelper.JsonMinify)",
+  "captured_at": "2026-07-30",
+  "vectors": [
+    {
+      "name": "spaces",
+      "input": "{ \"key\" : \"value\" }",
+      "output": "{\"key\":\"value\"}"
+    },
+    {
+      "name": "duplicate-keys-and-unicode",
+      "input": "{\"dup\":1, \"dup\":2, \"unicode\":\"雪\", \"escaped\":\"\\u96ea\"}",
+      "output": "{\"dup\":1,\"dup\":2,\"unicode\":\"雪\",\"escaped\":\"\\u96ea\"}"
+    },
+    {
+      "name": "number-format-and-nesting",
+      "input": "{\"number\":1.2300e+04, \"nested\": [ true, null, {\"x\":\"a b\"} ]}",
+      "output": "{\"number\":1.2300e+04,\"nested\":[true,null,{\"x\":\"a b\"}]}"
+    }
+  ]
+}

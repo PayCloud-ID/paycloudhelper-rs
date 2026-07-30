@@ -1,0 +1,15 @@
+[package]
+name = "pc-validate"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Custom validation rules (char_libs / numeric_null_libs) — mirrors validator.go."
+
+[lints]
+workspace = true
+
+[dependencies]
+pc-core.workspace = true
+regex.workspace = true

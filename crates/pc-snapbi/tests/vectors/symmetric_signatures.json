@@ -1,0 +1,36 @@
+{
+  "oracle": "Go crypto/hmac SHA-512 over the qoinhub SNAP-BI string-to-sign",
+  "captured_at": "2026-07-30",
+  "vectors": [
+    {
+      "name": "minified-body",
+      "secret": "super-secret-api-key",
+      "method": "POST",
+      "url": "/v1.0/transfer",
+      "token": "accessTok123",
+      "body": "{  \"b\": 2,\n \"a\": 1 }",
+      "timestamp": "2026-07-30T10:00:00+07:00",
+      "signature": "/LrFn35LmOc5cDL83yhRV6FQoMfVdKuVBFc7jLm/bE8ILZYpS7pCTTTDZ/NHEjwhIYuY/TZgGdfmt4okaNucQA=="
+    },
+    {
+      "name": "compact-body",
+      "secret": "secret",
+      "method": "POST",
+      "url": "/pay",
+      "token": "tok",
+      "body": "{\"amount\":1000,\"currency\":\"IDR\"}",
+      "timestamp": "2026-01-01T00:00:00Z",
+      "signature": "yYirLi3BbGFIDTLHo10wKUakgCz8+/eTEKPVpbltUtmm7HwSJgyHuu2lWtbmM0uO/FdbHWlnXbz4yoB0INK+xg=="
+    },
+    {
+      "name": "invalid-json-matches-go-ignored-minify-error",
+      "secret": "secret",
+      "method": "POST",
+      "url": "/pay",
+      "token": "tok",
+      "body": "{invalid}",
+      "timestamp": "2026-01-01T00:00:00Z",
+      "signature": "0nsL1YL3uA0vabWgBUcuvblzLhaFMUv0B9+p6U1HETlXHYw7ncPGqVVbR5Zi5pC8OoYuQmZln6C+MXMH6NGYbQ=="
+    }
+  ]
+}

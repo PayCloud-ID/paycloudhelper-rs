@@ -1,0 +1,19 @@
+[package]
+name = "pc-sentry"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Sentry client init + phlogger log-hook forwarding (parity port of paycloudhelper/phsentry)."
+
+[lints]
+workspace = true
+
+[dependencies]
+pc-core.workspace = true
+pc-log.workspace = true
+sentry.workspace = true
+tracing.workspace = true
+serde.workspace = true
+serde_json.workspace = true

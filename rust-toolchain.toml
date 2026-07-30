@@ -1,0 +1,5 @@
+[toolchain]
+# Pin the channel used for CI + local dev. MSRV is declared in Cargo.toml
+# (workspace.package.rust-version = "1.88"); this channel must be >= that.
+channel = "1.92.0"
+components = ["clippy", "rustfmt"]

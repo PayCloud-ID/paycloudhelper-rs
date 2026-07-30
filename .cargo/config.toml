@@ -1,0 +1,4 @@
+[resolver]
+# The workspace promises Rust 1.88. Prefer the newest transitive versions that
+# still honor that MSRV instead of silently locking newer-toolchain releases.
+incompatible-rust-versions = "fallback"

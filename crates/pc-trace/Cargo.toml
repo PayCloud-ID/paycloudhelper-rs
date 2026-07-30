@@ -1,0 +1,27 @@
+[package]
+name = "pc-trace"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "OpenTelemetry tracing + metrics helpers for PayCloud services (port of Go paycloudhelper/phtrace)."
+
+[lints]
+workspace = true
+
+[features]
+default = []
+# `amqp` enables the W3C traceparent AMQP carrier (InjectAMQP / ExtractAMQP),
+# pulling in lapin. Off by default so traces-only services do not compile lapin.
+amqp = ["dep:lapin"]
+
+[dependencies]
+pc-core.workspace = true
+opentelemetry.workspace = true
+opentelemetry-otlp.workspace = true
+opentelemetry_sdk.workspace = true
+opentelemetry-semantic-conventions.workspace = true
+anyhow.workspace = true
+tracing.workspace = true
+lapin = { workspace = true, optional = true }

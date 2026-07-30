@@ -1,0 +1,58 @@
+[package]
+name = "paycloudhelper"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Umbrella crate: feature-gated re-exports + explicit init() bootstrap."
+
+[lints]
+workspace = true
+
+[dependencies]
+anyhow.workspace = true
+pc-amqp = { workspace = true, optional = true }
+pc-audit = { workspace = true, optional = true }
+pc-auth = { workspace = true, optional = true }
+pc-config = { workspace = true, optional = true }
+pc-core = { workspace = true, optional = true }
+pc-db = { workspace = true, optional = true }
+pc-grpc = { workspace = true, optional = true }
+pc-health = { workspace = true, optional = true }
+pc-http = { workspace = true, optional = true }
+pc-json = { workspace = true, optional = true }
+pc-log = { workspace = true, optional = true }
+pc-redis = { workspace = true, optional = true }
+pc-resilience = { workspace = true, optional = true }
+pc-s3minio = { workspace = true, optional = true }
+pc-sentry = { workspace = true, optional = true }
+pc-snapbi = { workspace = true, optional = true }
+pc-trace = { workspace = true, optional = true }
+pc-validate = { workspace = true, optional = true }
+
+[features]
+default = []
+core = ["dep:pc-core"]
+config = ["dep:pc-config"]
+log = ["dep:pc-log"]
+trace = ["dep:pc-trace"]
+sentry = ["dep:pc-sentry"]
+json = ["dep:pc-json"]
+validate = ["dep:pc-validate"]
+resilience = ["dep:pc-resilience"]
+redis = ["dep:pc-redis"]
+db = ["dep:pc-db"]
+amqp = ["dep:pc-amqp"]
+audit = ["dep:pc-audit"]
+snapbi = ["dep:pc-snapbi"]
+http = ["dep:pc-http"]
+grpc = ["dep:pc-grpc"]
+auth = ["dep:pc-auth"]
+health = ["dep:pc-health"]
+s3minio = ["dep:pc-s3minio"]
+full = [
+    "core", "config", "log", "trace", "sentry", "json", "validate",
+    "resilience", "redis", "db", "amqp", "audit", "snapbi", "http",
+    "grpc", "auth", "health", "s3minio",
+]

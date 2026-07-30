@@ -1,0 +1,28 @@
+[package]
+name = "pc-redis"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lints]
+workspace = true
+
+[features]
+# `integration` gates tests that require a live Redis broker. Off by default so
+# `cargo test -p pc-redis` is green with no broker running.
+integration = []
+
+[dependencies]
+pc-core.workspace = true
+redis.workspace = true
+deadpool-redis.workspace = true
+rslock.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+anyhow.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true }

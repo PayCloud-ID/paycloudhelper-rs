@@ -1,0 +1,16 @@
+[package]
+name = "pc-json"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "JSON profiles — default + audit-trail (EscapeHTML=false + trailing newline). Mirrors phjson / json_codec.go."
+
+[lints]
+workspace = true
+
+[dependencies]
+pc-core.workspace = true
+serde.workspace = true
+serde_json.workspace = true

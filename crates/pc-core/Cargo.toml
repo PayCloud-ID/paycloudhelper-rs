@@ -1,0 +1,17 @@
+[package]
+name = "pc-core"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Base types + byte-exact JSON minifier shared by all paycloudhelper-rs crates."
+
+[lints]
+workspace = true
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+anyhow.workspace = true
