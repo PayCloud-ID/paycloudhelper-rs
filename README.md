@@ -27,7 +27,7 @@ consume it exactly as Go services consume `paycloudhelper` today.
 | `pc-audit` | audit trail V1/V2/TRX over `pc-amqp` |
 | `pc-snapbi` | SNAP-BI HMAC/RSA/AES/JWT + PEM parsing |
 | `pc-http` | `axum` bootstrap, `ResponseApi` envelope, headers, health probes |
-| `pc-grpc` | `tonic` client-pool factory (headless DNS, prewarm, deadline budget) |
+| `pc-grpc` | `tonic` client-pool factory (DNS round-robin, prewarm, deadline budget) |
 | `pc-auth` | axum middlewares: RevokeToken, CSRF, Idempotency |
 | `pc-health` | aggregated redis/rabbitmq/sentry health |
 | `pc-s3minio` | s3minio SDK client facade |

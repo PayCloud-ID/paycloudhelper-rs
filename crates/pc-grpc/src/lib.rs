@@ -5,8 +5,8 @@
 //! `app/grpc_metrics.go`, `structs/grpc_config.go`). It reproduces the
 //! `GrpcManager`/`GrpcClientPool` behaviour on top of `tonic`:
 //!
-//! * resolve a `<name>-headless` Kubernetes DNS target (see
-//!   [`headless_target`]),
+//! * dial the `host:port` DNS target exactly as configured (see
+//!   [`dial_target`] — no service-name suffix is added),
 //! * keep an N-connection round-robin pool with **prewarm**
 //!   (`GRPC_*_MAX_POOL`, default **2** — mirrors `getEnvInt("GRPC_*_MAX_POOL", 2)`),
 //! * retry connection establishment on transient failure (mirrors
@@ -19,8 +19,8 @@
 //! ([`child_budget`]/[`with_deadline`]): a child call's deadline is strictly
 //! less than the wall budget so it always expires first.
 //!
-//! The parity-critical *pure* logic — env parsing defaults, the headless-DNS
-//! target shape and the deadline-margin math — is unit-tested offline. Anything
+//! The parity-critical *pure* logic — env parsing defaults, the dial-target
+//! shape and the deadline-margin math — is unit-tested offline. Anything
 //! that needs a live gRPC server (an actual [`GrpcClientFactory::connect`]) is
 //! `#[ignore]`d.
 
@@ -134,7 +134,7 @@ impl GrpcConfig {
     }
 }
 
-/// gRPC channel factory over a headless-DNS round-robin pool.
+/// gRPC channel factory over a DNS round-robin pool.
 ///
 /// mirrors: `app.GrpcManager` + `app.GrpcClientPool` — one factory owns the
 /// `GRPC_*` config and hands out `tonic::transport::Channel`s that round-robin
@@ -178,13 +178,14 @@ impl GrpcClientFactory {
     /// round-robin `Channel` over a prewarmed N-connection pool.
     ///
     /// The env value is a bare `host:port` (e.g.
-    /// `paycloud-be-transaction-module:9106`); it is rewritten to the
-    /// `<name>-headless:<port>` Kubernetes headless target before dialling.
-    /// Establishment is retried on transient failure up to `GRPC_MAX_RETRIES`
-    /// (needs a live server — this is why any real `connect` test is `#[ignore]`d).
+    /// `paycloud-be-transaction-module:9106`) and is dialled as-is — no
+    /// service-name suffix is appended, so the DNS name is entirely the
+    /// deployment's choice. Establishment is retried on transient failure up to
+    /// `GRPC_MAX_RETRIES` (needs a live server — this is why any real `connect`
+    /// test is `#[ignore]`d).
     ///
     /// mirrors: `GrpcClientPool.GetConnection` + `createConnection` (round-robin
-    /// pool, retry-with-backoff establishment) over the headless target that
+    /// pool, retry-with-backoff establishment) over the target that
     /// `GrpcManager.initializeConnections` dials.
     pub async fn connect(&self, target_env: &str) -> Result<Channel> {
         let raw = std::env::var(target_env)
@@ -192,7 +193,7 @@ impl GrpcClientFactory {
         let (host, port) = parse_host_port(&raw)
             .with_context(|| format!("gRPC target `{target_env}`=`{raw}` is not host:port"))?;
 
-        let target = headless_target(&host, port);
+        let target = dial_target(&host, port);
         let pool = self.pool_size_for(target_env);
         let endpoint = self.build_endpoint(&target)?;
 
@@ -202,14 +203,14 @@ impl GrpcClientFactory {
         // upstream surfaces here (mirrors createConnection's retry loop).
         self.prewarm(&endpoint).await?;
 
-        // Round-robin pool: N identical headless subchannels
+        // Round-robin pool: N identical subchannels over the same DNS target
         // (mirrors GrpcClientPool's maxConn connections + round_robin policy).
         let endpoints = vec![endpoint; pool];
         Ok(Channel::balance_list(endpoints.into_iter()))
     }
 
     /// Build a configured (but not yet connected) [`Endpoint`] for a
-    /// `host:port` headless target.
+    /// `host:port` target.
     ///
     /// mirrors: the `grpc.DialOption` set in `NewGrpcClientPool`
     /// (keep-alive params, connect timeout) plus `resolveTransportCredentials`.
@@ -279,15 +280,17 @@ impl GrpcClientFactory {
     }
 }
 
-/// Format the Kubernetes headless-service DNS target the pool dials.
+/// Format the DNS target the pool dials.
 ///
-/// A bare service `name` and `port` (as carried in `TRANSACTION_GRPC=host:port`)
-/// become `<name>-headless:<port>`, whose A records back the round-robin pool.
+/// The service `name` and `port` (as carried in `TRANSACTION_GRPC=host:port`)
+/// are joined verbatim into `<name>:<port>`. **No suffix is appended** — the
+/// helper never rewrites the service name, so pointing at a headless service,
+/// a ClusterIP or an external host is purely a deployment/env decision.
 ///
 /// mirrors: the target string `GrpcManager.initializeConnections` dials via
-/// `helpers.GetTransactionGrpc()` (headless-service form).
-pub fn headless_target(name: &str, port: u16) -> String {
-    format!("{name}-headless:{port}")
+/// `helpers.GetTransactionGrpc()`.
+pub fn dial_target(name: &str, port: u16) -> String {
+    format!("{name}:{port}")
 }
 
 /// Split a `host:port` endpoint value into its parts.
@@ -368,12 +371,21 @@ mod tests {
     static ENV_LOCK: Mutex<()> = Mutex::new(());
 
     #[test]
-    fn headless_target_formats_name_and_port() {
+    fn dial_target_joins_name_and_port_without_suffix() {
         assert_eq!(
-            headless_target("paycloud-be-transaction-module", 9106),
+            dial_target("paycloud-be-transaction-module", 9106),
+            "paycloud-be-transaction-module:9106"
+        );
+        assert_eq!(dial_target("svc", 1), "svc:1");
+
+        // The helper must never inject a `-headless` (or any other) suffix —
+        // the DNS name comes from the env value alone.
+        assert!(!dial_target("svc", 1).contains("-headless"));
+        // An explicitly headless env value is preserved as-is, not doubled up.
+        assert_eq!(
+            dial_target("paycloud-be-transaction-module-headless", 9106),
             "paycloud-be-transaction-module-headless:9106"
         );
-        assert_eq!(headless_target("svc", 1), "svc-headless:1");
     }
 
     #[test]
@@ -382,10 +394,10 @@ mod tests {
         assert_eq!(host, "paycloud-be-transaction-module");
         assert_eq!(port, 9106);
 
-        // Round-trips into the headless target the pool dials.
+        // Round-trips unchanged into the target the pool dials.
         assert_eq!(
-            headless_target(&host, port),
-            "paycloud-be-transaction-module-headless:9106"
+            dial_target(&host, port),
+            "paycloud-be-transaction-module:9106"
         );
 
         assert!(parse_host_port("no-port").is_err());
