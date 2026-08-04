@@ -357,14 +357,33 @@ impl AuditPublisher {
                     let bytes = match pc_json::marshal_audit(&payload) {
                         Ok(bytes) => bytes,
                         Err(err) => {
-                            tracing::error!(error = %err, "[AuditPublisher] marshal failed");
+                            pc_log::log_e!("[AuditPublisher]", "marshal failed error={}", err);
                             continue;
                         }
                     };
+                    pc_log::log_d!(
+                        "[AuditPublisher]",
+                        "audit payload id={} body={}",
+                        payload.id,
+                        String::from_utf8_lossy(&bytes)
+                    );
                     match client.publish(&bytes, &ttl).await {
-                        Ok(()) => failures.store(0, Ordering::Release),
+                        Ok(()) => {
+                            failures.store(0, Ordering::Release);
+                            pc_log::log_i_rated_w!(
+                                "pc-audit.publish.ack",
+                                Duration::from_secs(60),
+                                "[AuditPublisher]",
+                                "publish ack"
+                            );
+                        }
                         Err(err) => {
-                            tracing::error!(id = payload.id, error = %err, "[AuditPublisher] push failed");
+                            pc_log::log_e!(
+                                "[AuditPublisher]",
+                                "push failed id={} error={}",
+                                payload.id,
+                                err
+                            );
                             record_failure(&failures, &open_until_ms, threshold, cooldown);
                         }
                     }

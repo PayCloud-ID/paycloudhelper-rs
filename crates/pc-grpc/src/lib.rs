@@ -290,7 +290,7 @@ impl GrpcClientFactory {
 /// mirrors: the target string `GrpcManager.initializeConnections` dials via
 /// `helpers.GetTransactionGrpc()`.
 pub fn dial_target(name: &str, port: u16) -> String {
-    format!("{name}:{port}")
+    return format!("{name}:{port}")
 }
 
 /// Split a `host:port` endpoint value into its parts.

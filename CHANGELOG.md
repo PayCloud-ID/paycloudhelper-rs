@@ -35,6 +35,15 @@ recorded here with the reason.
   signatures, and transaction-audit serialization.
 
 ### Fixed
+- `pc-log` now emits the golog-compatible plain-text transport (`[LEVL]
+  YYYY-MM-DD HH:MM:SS.mmm message`) in the process local timezone, honors
+  `APP_DEBUG_LOG`, preserves the per-template sampler/suppression suffix, and
+  shares one formatted message with `pc-sentry` forwarding.
+- The sampler accepts the legacy `APP_ENV=developement` spelling used by the Go
+  helper.
+- `pc-audit` mirrors the v1.11.1 audit echo policy: per-event payload echoes are
+  DEBUG and successful publish acknowledgements are a one-minute INFO heartbeat
+  carrying the shared suppressed-count suffix.
 - Updated `pc-trace` for the OpenTelemetry 0.27 metrics and propagation APIs so
   `--all-features` builds successfully.
 - Raised the MSRV from Rust 1.83 to 1.88 and pinned `time` to a patched release;

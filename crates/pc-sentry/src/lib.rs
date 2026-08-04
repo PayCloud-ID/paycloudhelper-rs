@@ -206,6 +206,7 @@ impl SentryOptions {
 /// function = [`DEFAULT_FUNC`], overlaid with `options.data`).
 #[must_use]
 pub fn init(options: &SentryOptions) -> Option<sentry::ClientInitGuard> {
+    pc_log::configure_log_forwarding(receive_log);
     if options.dsn.is_empty() {
         return None;
     }

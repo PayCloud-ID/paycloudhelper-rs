@@ -18,9 +18,11 @@
 //! layer sees an event its message is already fixed and a layer cannot rewrite
 //! it. So sampling and the suffix are applied at the emit site (the leveled
 //! macros), exactly as Go does, and [`init`] installs the env-tuned sampler as
-//! the process-global sampler those macros consult (plus the JSON subscriber).
+//! the process-global sampler those macros consult (plus the golog-compatible
+//! text subscriber).
 
 mod context;
+mod formatter;
 mod limiter;
 mod ratelimit;
 mod sampler;
@@ -37,7 +39,52 @@ pub use sampler::{initialize_sampler, sampler_config_for_env, SamplerConfig};
 /// mirrors: `phhelper.BuildLogPrefix`.
 pub use pc_core::build_log_prefix;
 
+use std::sync::{OnceLock, RwLock};
+
 use tracing_subscriber::prelude::*;
+
+type Forwarder = fn(&str, &str);
+
+#[derive(Clone, Copy)]
+struct Forwarding {
+    hook: Forwarder,
+    levels: u8,
+}
+
+const FORWARD_FATAL: u8 = 1 << 0;
+const FORWARD_ERROR: u8 = 1 << 1;
+const FORWARD_WARN: u8 = 1 << 2;
+const FORWARD_INFO: u8 = 1 << 3;
+const FORWARD_DEBUG: u8 = 1 << 4;
+
+static FORWARDING: OnceLock<RwLock<Option<Forwarding>>> = OnceLock::new();
+
+fn forwarding() -> &'static RwLock<Option<Forwarding>> {
+    FORWARDING.get_or_init(|| RwLock::new(None))
+}
+
+/// Registers the phlogger-compatible forwarding hook used by `pc-sentry`.
+/// The formatted message is shared with stdout; no second formatting pass is
+/// performed, so literal percent signs cannot diverge between the two sinks.
+pub fn configure_log_forwarding(hook: Forwarder) {
+    let enabled = |name: &str, default: bool| {
+        std::env::var(name).map_or(default, |value| value.eq_ignore_ascii_case("true"))
+    };
+    let mut levels = 0;
+    for (name, default, flag) in [
+        ("LOG_FORWARD_FATAL", true, FORWARD_FATAL),
+        ("LOG_FORWARD_ERROR", true, FORWARD_ERROR),
+        ("LOG_FORWARD_WARN", false, FORWARD_WARN),
+        ("LOG_FORWARD_INFO", false, FORWARD_INFO),
+        ("LOG_FORWARD_DEBUG", false, FORWARD_DEBUG),
+    ] {
+        if enabled(name, default) {
+            levels |= flag;
+        }
+    }
+    *forwarding().write().expect("log forwarding lock poisoned") =
+        Some(Forwarding { hook, levels });
+}
 
 /// Installs the process-wide logging stack.
 ///
@@ -45,22 +92,20 @@ use tracing_subscriber::prelude::*;
 /// `2006-01-02 15:04:05.000` (Rust strftime `%Y-%m-%d %H:%M:%S%.3f`) and
 /// initializes the sampler from `APP_ENV`.
 ///
-/// Installs a `tracing` JSON subscriber with a frozen field schema — `level`,
-/// `timestamp`, `prefix`, `message` — and initializes the env-tuned global
-/// sampler (see [`sampler_config_for_env`]). Idempotent: uses `try_init`, so a
-/// second call (or a subscriber already set) is a silent no-op.
+/// Installs the frozen golog-compatible text subscriber and initializes the
+/// env-tuned global sampler (see [`sampler_config_for_env`]). Idempotent: uses
+/// `try_init`, so a second call (or an existing subscriber) is a silent no-op.
 pub fn init() {
     initialize_sampler(sampler_config_for_env(pc_core::identity::app_env()));
 
-    let filter = tracing_subscriber::EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
+    let debug = std::env::var("APP_DEBUG_LOG")
+        .ok()
+        .is_some_and(|value| value.eq_ignore_ascii_case("true"));
+    let filter = tracing_subscriber::EnvFilter::new(if debug { "debug" } else { "info" });
 
     let fmt_layer = tracing_subscriber::fmt::layer()
-        .json()
-        .flatten_event(true)
-        .with_timer(timer::GoTimer)
-        .with_target(false)
-        .with_level(true);
+        .event_format(formatter::GoEventFormat)
+        .with_ansi(false);
 
     // try_init returns Err if a global subscriber is already set — idempotent.
     let _ = tracing_subscriber::registry()
@@ -88,6 +133,34 @@ pub mod __private {
         crate::ratelimit::sample_window(key, window)
     }
 
+    pub fn forward(level: &str, prefix: &impl std::fmt::Display, message: &str) {
+        let Some(config) = *super::forwarding()
+            .read()
+            .expect("log forwarding lock poisoned")
+        else {
+            return;
+        };
+        let flag = match level {
+            "fatal" => super::FORWARD_FATAL,
+            "error" => super::FORWARD_ERROR,
+            "warn" => super::FORWARD_WARN,
+            "info" => super::FORWARD_INFO,
+            "debug" => super::FORWARD_DEBUG,
+            _ => 0,
+        };
+        if config.levels & flag != 0 {
+            let prefix = prefix.to_string();
+            let rendered = if prefix.is_empty() {
+                message.to_owned()
+            } else if message.is_empty() {
+                prefix.clone()
+            } else {
+                format!("{prefix} {message}")
+            };
+            (config.hook)(level, &rendered);
+        }
+    }
+
     /// Appends the Go `" [+%d suppressed]"` suffix when `suppressed > 0`.
     ///
     /// mirrors: the `format += " [+%d suppressed]"` branch shared by every
@@ -106,9 +179,14 @@ pub mod __private {
 #[doc(hidden)]
 #[macro_export]
 macro_rules! __pc_emit {
-    ($level:ident, $prefix:expr, $msg:expr) => {
-        $crate::__private::tracing::$level!(prefix = %$prefix, message = %$msg)
-    };
+    (fatal, $prefix:expr, $msg:expr) => {{
+        $crate::__private::tracing::error!(pc_level = "fatal", prefix = %$prefix, message = %$msg);
+        $crate::__private::forward("fatal", &$prefix, &$msg);
+    }};
+    ($level:ident, $prefix:expr, $msg:expr) => {{
+        $crate::__private::tracing::$level!(prefix = %$prefix, message = %$msg);
+        $crate::__private::forward(::std::stringify!($level), &$prefix, &$msg);
+    }};
 }
 
 /// Internal: sample by the format-literal key, then emit.
@@ -204,7 +282,7 @@ macro_rules! log_e {
 #[macro_export]
 macro_rules! log_f {
     ($prefix:expr, $fmt:literal $(, $arg:expr)* $(,)?) => {
-        $crate::__pc_log!(error, $prefix, $fmt $(, $arg)*)
+        $crate::__pc_log!(fatal, $prefix, $fmt $(, $arg)*)
     };
 }
 
@@ -364,6 +442,20 @@ mod tests {
         assert_eq!(s.check("b"), (true, 0));
         assert_eq!(s.check("a"), (false, 0));
         assert_eq!(s.check("b"), (false, 0));
+    }
+
+    #[test]
+    fn production_storm_emits_initial_five_then_every_fiftieth() {
+        let s = Sampler::new(sampler_config_for_env(Some(pc_core::AppEnv::Production)));
+        let emitted = (0..500)
+            .filter_map(|_| {
+                let (allowed, suppressed) = s.check("retry storm");
+                allowed.then_some(suppressed)
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(emitted.len(), 14);
+        assert_eq!(&emitted[..5], &[0, 0, 0, 0, 0]);
+        assert!(emitted[5..].iter().all(|suppressed| *suppressed == 49));
     }
 
     #[test]

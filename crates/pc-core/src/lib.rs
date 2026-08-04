@@ -30,7 +30,7 @@ impl AppEnv {
     #[must_use]
     pub fn parse(s: &str) -> Option<Self> {
         match s {
-            "develop" | "dev" => Some(Self::Develop),
+            "develop" | "developement" | "dev" => Some(Self::Develop),
             "staging" | "stg" => Some(Self::Staging),
             "production" | "prod" => Some(Self::Production),
             _ => None,
@@ -117,6 +117,7 @@ mod tests {
     fn app_env_parse() {
         assert_eq!(AppEnv::parse("develop"), Some(AppEnv::Develop));
         assert_eq!(AppEnv::parse("dev"), Some(AppEnv::Develop));
+        assert_eq!(AppEnv::parse("developement"), Some(AppEnv::Develop));
         assert_eq!(AppEnv::parse("staging"), Some(AppEnv::Staging));
         assert_eq!(AppEnv::parse("production"), Some(AppEnv::Production));
         assert_eq!(AppEnv::parse("prod"), Some(AppEnv::Production));

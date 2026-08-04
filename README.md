@@ -15,7 +15,7 @@ consume it exactly as Go services consume `paycloudhelper` today.
 |---|---|
 | `pc-core` | `AppEnv`, app identity, `AppError`, `json_minify` (signature-hash input), log prefix |
 | `pc-config` | `.env` discovery + boot validation (mirrors `init.go`/`config.go`) |
-| `pc-log` | `tracing` subscriber, env sampler, rate-limited variants, `LogContext` |
+| `pc-log` | golog-compatible text subscriber, env sampler, rate-limited variants, `LogContext` |
 | `pc-trace` | OpenTelemetry OTLP init, AMQP traceparent carrier, phase histograms |
 | `pc-sentry` | Sentry init + log-hook forwarding |
 | `pc-json` | audit-trail JSON profile (`EscapeHTML=false` + trailing newline) |

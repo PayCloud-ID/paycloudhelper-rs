@@ -2320,11 +2320,11 @@ dependencies = [
  "pc-amqp",
  "pc-core",
  "pc-json",
+ "pc-log",
  "serde",
  "serde_json",
  "time",
  "tokio",
- "tracing",
 ]
 
 [[package]]
@@ -2432,6 +2432,7 @@ dependencies = [
  "dashmap",
  "governor",
  "pc-core",
+ "time",
  "tracing",
  "tracing-subscriber",
 ]
