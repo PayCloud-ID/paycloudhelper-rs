@@ -1,0 +1,117 @@
+{
+  "oracle": "qoinhub Go helpers.SignatureGenerate / helpers.EncryptAES / golang-jwt v5 (module replace against paycloud-be-qoinhubinterface-manager)",
+  "captured_at": "2026-08-11",
+  "note": "Throwaway RSA-2048 key generated at capture time; it signs nothing outside these tests. AES ciphertexts are decrypt-direction vectors: EncryptAES uses a random nonce, so an encrypt-direction vector cannot exist.",
+  "private_key_pkcs1_pem": "-----BEGIN RSA PRIVATE KEY-----\nMIIEogIBAAKCAQEAkH4EigJAnJuZ910Bqp00MnnwOLHftYYlX8/SRsR6OEvWg4ML\nnNjShjWoOhHvR32Usw6DAnqR8TJGV/nv8AFLOAAv6Zp+GwqvOrY32BUnNta/FZRX\nhZL5h2uKNt55SKraSo0NvVDw9iERx+m72dI/UTQtL+bXglGH6yuqwWAdwFiNnvQM\nwgqfmwdMhjvvph/9dxeV8jRn40FI1aK0kcNYdqNyZ8gyj3SmBC3UO3jFTMBk2yxh\n322JlEG9RRcxdq+UDm+mjXGWZvITE9ltabwCcwK4NHV2Gd0oY8sIUBuu3tDOKtX9\nn7fdSRoNsv6HmNEaTjcpp0BriTR7GjpULJ1sDwIDAQABAoIBACrEggdvXzx7efkT\nmFitqzN9kDLXw0VxbUKMusqjgSGEoPvQH/HO45FB9Icro81fSFIva2uiZ+wiW1vS\n6Mf7Og5bT9MvHUBXy0HviVv19uNucKSsgbNRq3X/yKsw8mkl2PLUCUsN2CSh6Sdo\n8WcpqgAZF37kLsmt5DMhe6s9DdFOctH1/LTj/32qZ30ke5BNEB33iDk/VBIxHKG2\n4S51OtSPbWYl9AUk697dd9nxrVIQI0ea4DSI97JZnAL3lC/kUWb0X6Q67AxzU0Md\n2f38VBt6U9kX0nX11DmT3ZyE/1dEOmo/I9vAj2CKgK0biVdUtria74e57LFcSPoE\nnVxMSzECgYEAwGo/E9brmXzTcm44dL6g5SPorLv2B67OMMgreycdEYxn+HoQBUNk\naq3bCKCsv6EpLsRwASnUIMD0i7DPYKJWBDKmsnLmCzk6mYpiD/Od3MrXAWhpNUYv\n7dKeWLg/k9qVUJ0IXODx30IDaGNyB6ljnsfCOuFA7k5EnI0zozBmP0MCgYEAwD2k\n3Ob+jby6qN/EcNZv9yjuKa7s02xPoqOam4HYRwy5/EvnSfJxFgtstIstevHBG6Ub\nB+ZVmVjyJ4Pr3lm25vGJd4pKtxSz99Ql3ubsay65Ww65gy95C2GwkDtCi1kR5Z79\n7axe9bLrBqigmz36Fc9WIOoInbszg5CsiTkctUUCgYBHDzXKUuXhYksIiJIK81ei\nJ/fGyweaYME/HL2KFrDSiULgbdu6xd+w0hIBBq2le5Qk9GDU3Si9C+WELUD41Brm\nI/qSDoLMhE8S4xtB/ts+7h4nI/MuvIP41X6rDyhTpzbbdZLgEibhJ5TwmUFEeRcU\nTXt6mTOMjpUiJ7d5PeeU1wKBgD8YfHHchxPyK7mdqBX468rNbk3UEfrag9C3rdj4\nZwn6zVhXeVQ19JPtsAIZ5BWEH4N5T0Pqf5HTNbdufw39mCB4ikvn4dnxO5hN0xgz\n5sjPDxsp3A2ImUv5BkBwksi1tUAOTP2jI4+055rJ4dzSHLDn2jb3WVibxq6Z32cy\njY+ZAoGAUrVFR9WDz74XvxxVsSVuwwwcB7a5Yy/XvEINpCPkaHUH7BIrAi8WgaYz\nvqyOIkzQ1f557XZtI5bzwdJ9hYxKjVPW/xV0JWzyogZ0y5q3alsu4NmGkC9l/aL4\nMjGz9cA9nbLmGQ97eZ/n+EsyWSLtIpo+7V1OmKy1CBjcGxEbQWQ=\n-----END RSA PRIVATE KEY-----\n",
+  "public_key_pkix_pem": "-----BEGIN PUBLIC KEY-----\nMIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAkH4EigJAnJuZ910Bqp00\nMnnwOLHftYYlX8/SRsR6OEvWg4MLnNjShjWoOhHvR32Usw6DAnqR8TJGV/nv8AFL\nOAAv6Zp+GwqvOrY32BUnNta/FZRXhZL5h2uKNt55SKraSo0NvVDw9iERx+m72dI/\nUTQtL+bXglGH6yuqwWAdwFiNnvQMwgqfmwdMhjvvph/9dxeV8jRn40FI1aK0kcNY\ndqNyZ8gyj3SmBC3UO3jFTMBk2yxh322JlEG9RRcxdq+UDm+mjXGWZvITE9ltabwC\ncwK4NHV2Gd0oY8sIUBuu3tDOKtX9n7fdSRoNsv6HmNEaTjcpp0BriTR7GjpULJ1s\nDwIDAQAB\n-----END PUBLIC KEY-----\n",
+  "rsa_pkcs1v15_sha256": [
+    {
+      "name": "b2b-token-request",
+      "client_key": "PAYCLOUD-CLIENT-KEY",
+      "timestamp": "2026-07-30T10:00:00+07:00",
+      "string_to_sign": "PAYCLOUD-CLIENT-KEY|2026-07-30T10:00:00+07:00",
+      "signature": "gb66ZLiOjai2wQyhHzv/q8Jrk2rxnClqY8aAQwSLSTa39uPy4fpMAUTNEijSaPSjy3a4MA+vRJGuFb7knMC2+otzjb7/oNf+ltI+/Q8AjCcu3bjGC7rldNVEKh0MgTvZgNJzluQtxWXepbcnfzRNm9JaHLT269AVbGDNvmthWFubOlaBV3ISOKZzGaSGjBWBoSJDa+YSy/QxxbVRyxDTVfSjVN8OM15t6emMgUwV+PA2Z3EzgNds0rEJ8GY9ZZel1ktNXshZaWwnCEe4g+OXUQfxuAKcUSQcP95xvJTQYqWge/0BMRGMoaj1YLgXZU0K+dwpVhGvClBGS0xdk3O58A=="
+    },
+    {
+      "name": "utc-timestamp",
+      "client_key": "another-client",
+      "timestamp": "2026-01-01T00:00:00Z",
+      "string_to_sign": "another-client|2026-01-01T00:00:00Z",
+      "signature": "cbye9Innnaes6G+6iaKP4LelinlnqOPN7qdz1gw47+oN8y/U6zb89h7KQnxDzdcywNnBqDByWdyy4SDJvNbE/zdyr0bLkt6Af3mI1wbpzwYZn/0ru1qBDTB2JvKjaiP5fyUgq9k5coB/qRcf2nll29CPSO1/qKjR/VY0qeNf+hGdHpSQ7GdRw4iXextVGT2PG9FmoLASumqb6ElO3vNrIZMRjCM8/bnKl+9toUzw+ALdc9Ym9uiZQT1T9ur4wtafqgUh0/Ok5fs7CnDJxCqvkGVo6+4rbeVLGlRa2hlpq87PfeIfzZ4r8nSkED73tTN8Y/7bHNGPvZc9+Jz/ofitsw=="
+    },
+    {
+      "name": "empty-client-key",
+      "client_key": "",
+      "timestamp": "2026-01-01T00:00:00Z",
+      "string_to_sign": "|2026-01-01T00:00:00Z",
+      "signature": "YHSehGXtVk3XIRmz2qE25K7gprI+QgFeoM1ou8QEJ5YF4lIrYgIgr1FZg6KTkxZaHmewhyWElqybjUuS+0YTZzlNrxLkVucsxLuuJjjGGRrFZ6dhEBRVSrwNfxWbzf+DdhI4DzIWNanZAvJtINcGmn4UcY6I/PNYjcAKXgI+gDN9Dlx0QbbZI3oik2rxJESVIj5nRj56Sy4TSfsG9XGOibMmpUn9Dusm5Vio1YFGGfEKd/GFS+6CwA7VkTWWx//Slg0BdmZJEJ+IWmA6J8i2H7HJ09BzO4bklMGcHIGk50X9AulGoQA0GHKhN/bsU1xUkg/1VbNvWo+DoxgrMXpefQ=="
+    }
+  ],
+  "aes_256_gcm_decrypt": [
+    {
+      "name": "short-plaintext",
+      "key": "0123456789abcdef0123456789abcdef",
+      "plaintext": "hello",
+      "ciphertext": "VrRQ68OjpYqmQomQG1FxfZRSAgi76jZ186SITkBcdgrM"
+    },
+    {
+      "name": "pem-shaped-plaintext",
+      "key": "0123456789abcdef0123456789abcdef",
+      "plaintext": "-----BEGIN RSA PRIVATE KEY-----\nMIIE\n-----END RSA PRIVATE KEY-----\n",
+      "ciphertext": "W2hK1qC+PP4Ph99FyPm7ZAV9hHFgdK3TMGcAjkBHNeX3wi9GjFnyaRFOWD/sX7Cka6XjV0GxlwrEGHtNPbdZj5cbMw0ThPiWPaG1n1dEdRlGPAi2pv0LIm+hiGkrsQA="
+    },
+    {
+      "name": "empty-plaintext",
+      "key": "0123456789abcdef0123456789abcdef",
+      "plaintext": "",
+      "ciphertext": "VxhFQoPySbK8cQGZzIkwUn5hQ6mwkc+vz9wS8w=="
+    }
+  ],
+  "aes_non32_key_go_ciphertext": [
+    {
+      "name": "go-raw-key-len-16",
+      "key": "0123456789abcdef",
+      "plaintext": "hello",
+      "ciphertext": "1T/fFpdimpp7xhgJFwcCTDFKLrEEn5UYtk5V2WXCwrgp"
+    },
+    {
+      "name": "go-raw-key-len-24",
+      "key": "0123456789abcdef01234567",
+      "plaintext": "hello",
+      "ciphertext": "7FegwnkWzDFw5+DMr6Os0BW/+jt4+CWbnffrKH+/5biX"
+    }
+  ],
+  "aes_key_size_policy": [
+    {
+      "name": "len-16",
+      "key": "0123456789abcdef",
+      "key_len": 16,
+      "ok": true,
+      "go_error": ""
+    },
+    {
+      "name": "len-24",
+      "key": "0123456789abcdef01234567",
+      "key_len": 24,
+      "ok": true,
+      "go_error": ""
+    },
+    {
+      "name": "len-32",
+      "key": "0123456789abcdef0123456789abcdef",
+      "key_len": 32,
+      "ok": true,
+      "go_error": ""
+    },
+    {
+      "name": "len-5",
+      "key": "short",
+      "key_len": 5,
+      "ok": false,
+      "go_error": "crypto/aes: invalid key size 5"
+    },
+    {
+      "name": "len-48",
+      "key": "0123456789abcdef0123456789abcdef0123456789abcdef",
+      "key_len": 48,
+      "ok": false,
+      "go_error": "crypto/aes: invalid key size 48"
+    }
+  ],
+  "jwt_rs256": [
+    {
+      "name": "callback-token-rs256",
+      "token": "eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCJ9.eyJjbGllbnRJZCI6IlBBWUNMT1VELUNMSUVOVC1LRVkiLCJjbGllbnRLZXkiOiJQQVlDTE9VRC1DTElFTlQtS0VZIiwiZXhwIjo0MTAyNDQ0ODAwfQ.DqVZiHuIrQ1Gb0LHH834o00fxzLH8dFkrmt9jJqpNf95Ivx_E3AIW0O8gis60vnkt6KHubWQ0q9uEQEmPkbBRtaa1h977ciBFHkYtmy52IYG_5ivoBtUSmoB3luUr-f1l9f3sp2PVDcP7z1qsfvI8-hYEaEwU91CCKWKqpgIs_nKAbn5QdPT5-P6t33RQhFJQp1qYzXku0jCZn6G7oVadroRNkDBa192NswpAVntHDMhWjEun4SrNXxuXIs1Tnszt9Cosd2unZ0SjnEK2keW_HRNiSfxUtYKqnqvUHou6Y04Z8wdFXsq_MDJiMpmeJqPxI8fuqTM8aFnojhKv7xuNw",
+      "claims": {
+        "clientId": "PAYCLOUD-CLIENT-KEY",
+        "clientKey": "PAYCLOUD-CLIENT-KEY",
+        "exp": 4102444800
+      }
+    },
+    {
+      "name": "algorithm-confusion-hs256-must-reject",
+      "token": "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJjbGllbnRJZCI6IlBBWUNMT1VELUNMSUVOVC1LRVkiLCJjbGllbnRLZXkiOiJQQVlDTE9VRC1DTElFTlQtS0VZIiwiZXhwIjo0MTAyNDQ0ODAwfQ.0_sMbOg1Pmqz_q82RnfYlfFpeKnX0xlyPdlh9BYpILw",
+      "claims": null
+    }
+  ]
+}

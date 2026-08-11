@@ -125,6 +125,49 @@ pub fn clamp_ttl_with_max(ttl_ms: i64, max_minutes: i64) -> i64 {
     ttl_ms
 }
 
+/// Outcome of a [`RedisPool::ttl`] lookup.
+///
+/// Redis `PTTL` overloads one integer with three distinct answers, and
+/// collapsing them into `Option<Duration>` loses the one that matters: a key
+/// that is absent and a key that never expires both become `None`, so a caller
+/// deciding whether to refresh cannot tell "gone" from "permanent".
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KeyTtl {
+    /// The key does not exist (`PTTL` → `-2`).
+    Missing,
+    /// The key exists with no expiry set (`PTTL` → `-1`).
+    NoExpiry,
+    /// The key exists and expires after this much longer (`PTTL` → `>= 0`).
+    Expires(Duration),
+}
+
+impl KeyTtl {
+    /// Interpret a raw `PTTL` reply.
+    #[must_use]
+    pub fn from_pttl(ms: i64) -> Self {
+        match ms {
+            -2 => Self::Missing,
+            -1 => Self::NoExpiry,
+            // Redis never returns another negative; treat one as no-expiry
+            // rather than panicking on `Duration::from_millis` underflow.
+            ms if ms < 0 => Self::NoExpiry,
+            ms => Self::Expires(Duration::from_millis(ms.unsigned_abs())),
+        }
+    }
+
+    /// The remaining lifetime, or `None` when the key is missing or permanent.
+    ///
+    /// Use when "how long is left" is the only question and both other answers
+    /// mean "do not reuse this TTL".
+    #[must_use]
+    pub fn remaining(self) -> Option<Duration> {
+        match self {
+            Self::Expires(d) => Some(d),
+            Self::Missing | Self::NoExpiry => None,
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Lock timing config (Go: GetTrxRedisLockTimeout / GetTrxRedisBackoff).
 // ---------------------------------------------------------------------------
@@ -321,6 +364,22 @@ impl RedisPool {
         Ok(val)
     }
 
+    /// Read the remaining time-to-live of `key` (Redis `PTTL`).
+    ///
+    /// Millisecond precision, so a TTL written by [`RedisPool::store`] round
+    /// trips without the one-second truncation `TTL` would impose.
+    ///
+    /// This has **no Go counterpart** — `paycloudhelper` never reads a TTL back.
+    /// It exists because a caller layering an in-process cache over Redis cannot
+    /// otherwise learn how long a shared entry has left: recomputing it from the
+    /// value's own expiry field (an `expiresIn`, say) restarts the clock and
+    /// silently extends the effective lifetime beyond what the writer intended.
+    pub async fn ttl(&self, key: &str) -> anyhow::Result<KeyTtl> {
+        let mut conn = self.pool.get().await?;
+        let ms: i64 = conn.pttl(key).await?;
+        Ok(KeyTtl::from_pttl(ms))
+    }
+
     /// Delete `key`. Deleting a missing key is not an error.
     ///
     /// mirrors: `DeleteRedisWithContext` / `DeleteRedis`.
@@ -447,7 +506,55 @@ mod tests {
         assert_eq!(trx_backoff_ms_from(Some(50)), 50);
     }
 
+    #[test]
+    fn key_ttl_distinguishes_missing_from_permanent() {
+        assert_eq!(KeyTtl::from_pttl(-2), KeyTtl::Missing);
+        assert_eq!(KeyTtl::from_pttl(-1), KeyTtl::NoExpiry);
+        assert_eq!(
+            KeyTtl::from_pttl(1_500),
+            KeyTtl::Expires(Duration::from_millis(1_500))
+        );
+        // A key that has just expired but not yet been reaped reads as 0ms.
+        assert_eq!(KeyTtl::from_pttl(0), KeyTtl::Expires(Duration::ZERO));
+
+        // Only a real remaining lifetime is reusable as a TTL.
+        assert_eq!(
+            KeyTtl::from_pttl(1_500).remaining(),
+            Some(Duration::from_millis(1_500))
+        );
+        assert_eq!(KeyTtl::from_pttl(-1).remaining(), None);
+        assert_eq!(KeyTtl::from_pttl(-2).remaining(), None);
+
+        // Out-of-contract negatives must not underflow into a huge Duration.
+        assert_eq!(KeyTtl::from_pttl(i64::MIN), KeyTtl::NoExpiry);
+    }
+
     // ---- live-Redis round-trips (require a broker; ignored by default) ----
+
+    #[tokio::test]
+    #[ignore = "requires a live Redis broker (set REDIS_HOST)"]
+    async fn ttl_reads_back_the_stored_expiry() {
+        let pool = init_from_env().await.unwrap().expect("REDIS_HOST set");
+        let key = "pc-redis:test:ttl";
+
+        assert_eq!(pool.ttl(key).await.unwrap(), KeyTtl::Missing);
+
+        pool.store(key, &"hello", Duration::from_secs(30))
+            .await
+            .unwrap();
+        let remaining = pool.ttl(key).await.unwrap().remaining().expect("expiring");
+        assert!(
+            remaining <= Duration::from_secs(30) && remaining > Duration::from_secs(25),
+            "PTTL should report just under the written 30s, got {remaining:?}"
+        );
+
+        // A zero TTL writes with no expiry (see `store`), not a 0ms expiry.
+        pool.store(key, &"hello", Duration::ZERO).await.unwrap();
+        assert_eq!(pool.ttl(key).await.unwrap(), KeyTtl::NoExpiry);
+
+        pool.delete(key).await.unwrap();
+        assert_eq!(pool.ttl(key).await.unwrap(), KeyTtl::Missing);
+    }
 
     #[tokio::test]
     #[ignore = "requires a live Redis broker (set REDIS_HOST)"]

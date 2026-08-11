@@ -37,15 +37,15 @@ consume it exactly as Go services consume `paycloudhelper` today.
 
 ```toml
 [dependencies]
-pc-config = { git = "ssh://git@github.com/PayCloud-ID/paycloudhelper-rs", tag = "v0.1.0" }
-pc-log    = { git = "ssh://git@github.com/PayCloud-ID/paycloudhelper-rs", tag = "v0.1.0" }
+pc-config = { git = "ssh://git@github.com/PayCloud-ID/paycloudhelper-rs", tag = "v1.0.2" }
+pc-log    = { git = "ssh://git@github.com/PayCloud-ID/paycloudhelper-rs", tag = "v1.0.2" }
 # ...only the crates the service needs
 ```
 
 Or via the umbrella, feature-gated:
 
 ```toml
-paycloudhelper = { git = "ssh://git@github.com/PayCloud-ID/paycloudhelper-rs", tag = "v0.1.0",
+paycloudhelper = { git = "ssh://git@github.com/PayCloud-ID/paycloudhelper-rs", tag = "v1.0.2",
                    default-features = false, features = ["config", "log", "redis", "snapbi", "http"] }
 ```
 
