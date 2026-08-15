@@ -162,6 +162,36 @@ fn env_nonempty(key: &str) -> bool {
     std::env::var(key).map(|v| !v.is_empty()).unwrap_or(false)
 }
 
+/// Accepted spellings for each RabbitMQ audit-trail setting, one row per
+/// logical setting.
+///
+/// `RABBITMQ_*` are the names this validator originally shipped with. `RQ_*` are
+/// what PayCloud's env-data actually deploys — for every service, in every
+/// environment. Checking only the former meant the count was ALWAYS zero on a
+/// real deployment, so services logged "audit trail not configured - audit trail
+/// disabled" while their audit publisher ran perfectly well. That is worse than
+/// no check: it trains operators to ignore the one line that would tell them
+/// auditing had genuinely stopped.
+const AUDITTRAIL_KEY_ALIASES: [&[&str]; 6] = [
+    &["RABBITMQ_HOST", "RQ_HOST"],
+    &["RABBITMQ_PORT", "RQ_PORT"],
+    &["RABBITMQ_VIRTUAL_HOST_AUDITTRAIL", "RQ_VHOST"],
+    &["RABBITMQ_USERNAME_AUDITTRAIL", "RQ_USERNAME"],
+    &["RABBITMQ_PASSWORD_AUDITTRAIL", "RQ_PASSWORD"],
+    &["RABBITMQ_QUEUE_AUDITTRAIL", "RQ_QUEUE_AUDITTRAIL"],
+];
+
+/// Count logical settings that have at least one spelling present.
+///
+/// Takes the lookup as a parameter so the alias logic is testable without
+/// mutating process-global environment state.
+fn count_configured(aliases: &[&[&str]], present: impl Fn(&str) -> bool) -> usize {
+    aliases
+        .iter()
+        .filter(|row| row.iter().any(|key| present(key)))
+        .count()
+}
+
 /// mirrors: `config.go ValidateConfiguration`.
 ///
 /// Note: the Redis `Addr`/`Password` checks in the Go version read
@@ -208,16 +238,19 @@ pub fn validate_configuration() -> Vec<ConfigError> {
     }
 
     // RabbitMQ audit trail: warn only on partial configuration (some-but-not-all).
-    let rabbit_keys = [
-        "RABBITMQ_HOST",
-        "RABBITMQ_PORT",
-        "RABBITMQ_VIRTUAL_HOST_AUDITTRAIL",
-        "RABBITMQ_USERNAME_AUDITTRAIL",
-        "RABBITMQ_PASSWORD_AUDITTRAIL",
-        "RABBITMQ_QUEUE_AUDITTRAIL",
-    ];
-    let total = rabbit_keys.len();
-    let configured = rabbit_keys.iter().filter(|k| env_nonempty(k)).count();
+    //
+    // Each row is one logical setting with its accepted spellings. The
+    // `RABBITMQ_*` names are the ones this validator originally shipped with;
+    // the `RQ_*` names are what PayCloud's env-data actually deploys, for every
+    // service, in every environment.
+    //
+    // Checking only `RABBITMQ_*` meant `configured` was ALWAYS 0 on a real
+    // deployment, so every service logged "audit trail not configured - audit
+    // trail disabled" while its audit publisher was running perfectly well. That
+    // is worse than no check: it trains operators to ignore the one line that
+    // would tell them auditing had genuinely stopped.
+    let total = AUDITTRAIL_KEY_ALIASES.len();
+    let configured = count_configured(&AUDITTRAIL_KEY_ALIASES, env_nonempty);
     if configured > 0 && configured < total {
         errors.push(ConfigError::warn(
             "RabbitMQ",
@@ -269,6 +302,61 @@ mod tests {
         assert_eq!(v["field"], "APP_ENV");
         assert_eq!(v["message"], "bad");
         assert_eq!(v["level"], "warning");
+    }
+
+    /// The regression: PayCloud deploys `RQ_*`, so a validator that only knows
+    /// `RABBITMQ_*` reports "not configured" on a perfectly configured service.
+    #[test]
+    fn rq_spelling_counts_as_configured() {
+        let deployed = [
+            "RQ_HOST",
+            "RQ_PORT",
+            "RQ_VHOST",
+            "RQ_USERNAME",
+            "RQ_PASSWORD",
+            "RQ_QUEUE_AUDITTRAIL",
+        ];
+        let configured = count_configured(&AUDITTRAIL_KEY_ALIASES, |k| deployed.contains(&k));
+        assert_eq!(
+            configured,
+            AUDITTRAIL_KEY_ALIASES.len(),
+            "the real staging env must count as fully configured"
+        );
+    }
+
+    #[test]
+    fn legacy_rabbitmq_spelling_still_counts() {
+        let deployed = [
+            "RABBITMQ_HOST",
+            "RABBITMQ_PORT",
+            "RABBITMQ_VIRTUAL_HOST_AUDITTRAIL",
+            "RABBITMQ_USERNAME_AUDITTRAIL",
+            "RABBITMQ_PASSWORD_AUDITTRAIL",
+            "RABBITMQ_QUEUE_AUDITTRAIL",
+        ];
+        let configured = count_configured(&AUDITTRAIL_KEY_ALIASES, |k| deployed.contains(&k));
+        assert_eq!(configured, AUDITTRAIL_KEY_ALIASES.len());
+    }
+
+    #[test]
+    fn nothing_set_is_zero_and_partial_is_partial() {
+        assert_eq!(count_configured(&AUDITTRAIL_KEY_ALIASES, |_| false), 0);
+        let partial = ["RQ_HOST", "RQ_PORT"];
+        assert_eq!(
+            count_configured(&AUDITTRAIL_KEY_ALIASES, |k| partial.contains(&k)),
+            2,
+            "partial config must still be detectable so the partial warning fires"
+        );
+    }
+
+    /// Mixing conventions must not double-count a single logical setting.
+    #[test]
+    fn mixed_spellings_do_not_double_count() {
+        let deployed = ["RABBITMQ_HOST", "RQ_HOST"];
+        assert_eq!(
+            count_configured(&AUDITTRAIL_KEY_ALIASES, |k| deployed.contains(&k)),
+            1
+        );
     }
 
     #[test]
