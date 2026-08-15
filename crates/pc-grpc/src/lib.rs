@@ -15,6 +15,12 @@
 //! * apply keep-alive, idle/lifetime and TLS settings per `GRPC_*` env vars
 //!   (mirrors `DefaultConfig`/`ApplyGrpcEnvConfig`/`resolveTransportCredentials`).
 //!
+//! [`GrpcClientFactory::connect`] prewarms and therefore *fails* when the
+//! upstream is unreachable — correct when the dependency is required.
+//! [`GrpcClientFactory::connect_lazy`] builds the identical pool without the
+//! probe, for services that must boot degraded instead of refusing to start.
+//! Neither needs the caller to rebuild endpoints by hand.
+//!
 //! It also provides the RC-1 shrinking-budget deadline helpers
 //! ([`child_budget`]/[`with_deadline`]): a child call's deadline is strictly
 //! less than the wall budget so it always expires first.
@@ -188,13 +194,7 @@ impl GrpcClientFactory {
     /// pool, retry-with-backoff establishment) over the target that
     /// `GrpcManager.initializeConnections` dials.
     pub async fn connect(&self, target_env: &str) -> Result<Channel> {
-        let raw = std::env::var(target_env)
-            .with_context(|| format!("gRPC target env `{target_env}` is not set"))?;
-        let (host, port) = parse_host_port(&raw)
-            .with_context(|| format!("gRPC target `{target_env}`=`{raw}` is not host:port"))?;
-
-        let target = dial_target(&host, port);
-        let pool = self.pool_size_for(target_env);
+        let (target, pool) = self.resolve_target(target_env)?;
         let endpoint = self.build_endpoint(&target)?;
 
         tracing::info!(target = %target, pool, "pc-grpc: prewarming round-robin channel");
@@ -207,6 +207,54 @@ impl GrpcClientFactory {
         // (mirrors GrpcClientPool's maxConn connections + round_robin policy).
         let endpoints = vec![endpoint; pool];
         Ok(Channel::balance_list(endpoints.into_iter()))
+    }
+
+    /// Build the same round-robin pool as [`GrpcClientFactory::connect`] but
+    /// **without** the prewarm probe, so an unresolvable or dead target does not
+    /// abort the caller. `tonic` re-dials the returned channel in the
+    /// background; calls made before the first connection succeeds fail with
+    /// `UNAVAILABLE` rather than panicking.
+    ///
+    /// Use this when the service must start in a degraded state instead of
+    /// refusing to boot — a Kubernetes rollout where dependencies come up in an
+    /// arbitrary order, for example. [`GrpcClientFactory::connect`] remains the
+    /// default: it surfaces a dead upstream at startup, which is what you want
+    /// when the dependency is genuinely required.
+    ///
+    /// Synchronous, because no connection is established. It must still be
+    /// called **from inside a Tokio runtime**: `Channel::balance_list` spawns
+    /// the balancer task eagerly and panics without a reactor. Calling it from
+    /// `main` before the runtime starts, or from a plain `#[test]`, panics.
+    ///
+    /// mirrors: `createConnection` with the retry loop skipped — the same
+    /// `grpc.DialOption` set and `maxConn` round-robin pool that
+    /// `GrpcManager.initializeConnections` builds.
+    pub fn connect_lazy(&self, target_env: &str) -> Result<Channel> {
+        let (target, pool) = self.resolve_target(target_env)?;
+        let endpoint = self.build_endpoint(&target)?;
+
+        tracing::info!(
+            target = %target,
+            pool,
+            "pc-grpc: lazy round-robin channel (no prewarm)"
+        );
+
+        let endpoints = vec![endpoint; pool];
+        Ok(Channel::balance_list(endpoints.into_iter()))
+    }
+
+    /// Resolve a `*_GRPC` target env name to its dial target and pool size
+    /// without connecting.
+    ///
+    /// Exposed so callers can log or assert on what *would* be dialled — and so
+    /// they never have to re-derive it by hand from
+    /// [`parse_host_port`] + [`dial_target`] + [`GrpcClientFactory::pool_size_for`].
+    pub fn resolve_target(&self, target_env: &str) -> Result<(String, usize)> {
+        let raw = std::env::var(target_env)
+            .with_context(|| format!("gRPC target env `{target_env}` is not set"))?;
+        let (host, port) = parse_host_port(&raw)
+            .with_context(|| format!("gRPC target `{target_env}`=`{raw}` is not host:port"))?;
+        Ok((dial_target(&host, port), self.pool_size_for(target_env)))
     }
 
     /// Build a configured (but not yet connected) [`Endpoint`] for a
@@ -290,7 +338,7 @@ impl GrpcClientFactory {
 /// mirrors: the target string `GrpcManager.initializeConnections` dials via
 /// `helpers.GetTransactionGrpc()`.
 pub fn dial_target(name: &str, port: u16) -> String {
-    return format!("{name}:{port}")
+    format!("{name}:{port}")
 }
 
 /// Split a `host:port` endpoint value into its parts.
@@ -515,6 +563,52 @@ mod tests {
         for k in keys {
             std::env::remove_var(k);
         }
+    }
+
+    #[test]
+    fn resolve_target_reports_dial_target_and_pool_size() {
+        let _guard = ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+
+        std::env::remove_var("GRPC_TRANSACTION_MAX_POOL");
+        std::env::set_var("TRANSACTION_GRPC", "paycloud-be-transaction-module:9106");
+        let factory = GrpcClientFactory::from_env().unwrap();
+
+        let (target, pool) = factory.resolve_target("TRANSACTION_GRPC").unwrap();
+        assert_eq!(target, "paycloud-be-transaction-module:9106");
+        assert_eq!(pool, DEFAULT_MAX_POOL);
+
+        // A malformed or absent env value is an error, not a panic.
+        std::env::set_var("TRANSACTION_GRPC", "no-port");
+        assert!(factory.resolve_target("TRANSACTION_GRPC").is_err());
+        std::env::remove_var("TRANSACTION_GRPC");
+        assert!(factory.resolve_target("TRANSACTION_GRPC").is_err());
+    }
+
+    // Not a plain `#[test]`: `balance_list` spawns its balancer eagerly and
+    // panics with "there is no reactor running" outside a Tokio context. The
+    // call itself is still synchronous — see `connect_lazy`'s docs.
+    #[tokio::test]
+    async fn connect_lazy_survives_an_unresolvable_target() {
+        let _guard = ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+
+        // The whole point: a DNS name that cannot resolve must still yield a
+        // channel, because the caller has to boot degraded rather than abort.
+        // `connect` would exhaust its retries here and return Err.
+        std::env::set_var("TRANSACTION_GRPC", "unresolvable.invalid:9106");
+        std::env::set_var("GRPC_TLS_MODE", "");
+        let factory = GrpcClientFactory::from_env().unwrap();
+
+        let channel = factory
+            .connect_lazy("TRANSACTION_GRPC")
+            .expect("a lazy channel needs no reachable upstream");
+        drop(channel);
+
+        std::env::remove_var("TRANSACTION_GRPC");
+        std::env::remove_var("GRPC_TLS_MODE");
     }
 
     #[tokio::test]

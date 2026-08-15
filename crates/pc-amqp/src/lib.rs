@@ -5,6 +5,12 @@
 //! connection name `amqp-<AppName>`, a five-second heartbeat, JSON messages,
 //! default TTL `60000`, bounded publish retries, manual-ack consumers, and
 //! request/reply correlation.
+//!
+//! Beyond the Go surface: [`AmqpClient::publish_to`] targets an arbitrary
+//! routing key, and [`AmqpClient::reply`] answers an inbound delivery on its
+//! own `reply_to` queue with the requester's correlation ID. Go's helper only
+//! ever published to its own queue, so a service *answering* requests had no
+//! path through it.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -12,6 +18,7 @@ use std::time::Duration;
 use anyhow::{anyhow, Context};
 use async_trait::async_trait;
 use futures::StreamExt;
+use lapin::message::Delivery;
 use lapin::options::{
     BasicAckOptions, BasicConsumeOptions, BasicPublishOptions, BasicQosOptions,
     ConfirmSelectOptions, QueueDeclareOptions,
@@ -201,6 +208,7 @@ impl AmqpClient {
 
     async fn publish_once(
         &self,
+        routing_key: &str,
         data: &[u8],
         ttl_ms: Option<&str>,
         extra: BasicProperties,
@@ -212,7 +220,7 @@ impl AmqpClient {
         }
         let confirm = state
             .channel
-            .basic_publish("", &self.queue, BasicPublishOptions::default(), data, props)
+            .basic_publish("", routing_key, BasicPublishOptions::default(), data, props)
             .await?
             .await?;
         if confirm.is_nack() {
@@ -227,7 +235,12 @@ impl AmqpClient {
             let mut last = None;
             for attempt in 0..PUSH_MAX_RETRIES {
                 match self
-                    .publish_once(data, Some(DEFAULT_MESSAGE_TTL), BasicProperties::default())
+                    .publish_once(
+                        &self.queue,
+                        data,
+                        Some(DEFAULT_MESSAGE_TTL),
+                        BasicProperties::default(),
+                    )
                     .await
                 {
                     Ok(()) => return Ok(()),
@@ -252,11 +265,58 @@ impl AmqpClient {
     /// An empty TTL disables message expiration.
     pub async fn push_with_ttl(&self, data: &[u8], ttl_ms: &str) -> anyhow::Result<()> {
         self.publish_once(
+            &self.queue,
             data,
             (!ttl_ms.is_empty()).then_some(ttl_ms),
             BasicProperties::default(),
         )
         .await
+    }
+
+    /// Publish to an arbitrary `routing_key` with caller-supplied properties.
+    ///
+    /// [`AmqpClient::push`] and [`AmqpClient::push_with_ttl`] always target the
+    /// client's own queue, which is all Go's `AmqpHelper` ever needed. A service
+    /// answering a request must publish to the *requester's* `reply_to` queue
+    /// instead, and carry the correlation ID the requester chose — neither is
+    /// reachable through the queue-bound publishers.
+    ///
+    /// Publisher confirms still apply; a broker `nack` is an error. There is no
+    /// retry loop here (unlike `push`): a reply whose consumer has already timed
+    /// out should fail fast rather than be redelivered 15 seconds later.
+    ///
+    /// Prefer [`AmqpClient::reply`] for the request/reply case — it derives both
+    /// the routing key and the correlation ID from the inbound delivery, which
+    /// is where they get mismatched by hand.
+    pub async fn publish_to(
+        &self,
+        routing_key: &str,
+        data: &[u8],
+        properties: BasicProperties,
+    ) -> anyhow::Result<()> {
+        if routing_key.trim().is_empty() {
+            return Err(anyhow!("[AMQP] publish routing key must not be empty"));
+        }
+        self.publish_once(routing_key, data, None, properties).await
+    }
+
+    /// Answer `delivery` on its `reply_to` queue, inheriting its correlation ID.
+    ///
+    /// The reply carries [`REPLY_MESSAGE_TTL`] so an orphaned reply cannot
+    /// accumulate on a queue whose consumer is gone — the same TTL
+    /// [`AmqpClient::send_wait`] puts on the request side.
+    ///
+    /// Returns an error when the delivery carries no `reply_to`: that is a
+    /// malformed request, and silently dropping the answer would leave the
+    /// caller blocked until its own timeout with no signal as to why.
+    ///
+    /// This does **not** ack `delivery` — ack ordering is the caller's, and a
+    /// service that must confirm the reply before acking (so a crash between the
+    /// two redelivers rather than loses the request) needs to sequence them
+    /// itself.
+    pub async fn reply(&self, delivery: &Delivery, data: &[u8]) -> anyhow::Result<()> {
+        let (reply_to, props) = reply_target(&delivery.properties)?;
+        self.publish_once(&reply_to, data, None, props).await
     }
 
     /// Create a manual-ack consumer with prefetch count one.
@@ -311,7 +371,7 @@ impl AmqpClient {
             .with_reply_to(ShortString::from(reply_queue))
             .with_correlation_id(ShortString::from(correlation.clone()))
             .with_expiration(ShortString::from(REPLY_MESSAGE_TTL));
-        self.publish_once(data, None, props).await?;
+        self.publish_once(&self.queue, data, None, props).await?;
 
         tokio::time::timeout(timeout, async {
             while let Some(delivery) = consumer.next().await {
@@ -367,6 +427,29 @@ impl Publisher for AmqpClient {
     }
 }
 
+/// Derive the reply queue and outbound properties from an inbound request's
+/// properties.
+///
+/// Split out from [`AmqpClient::reply`] so the correlation-inheritance rule —
+/// the part that is silently wrong when hand-rolled — is testable without a
+/// broker.
+fn reply_target(request: &BasicProperties) -> anyhow::Result<(String, BasicProperties)> {
+    let reply_to = request
+        .reply_to()
+        .as_ref()
+        .map(ShortString::to_string)
+        .filter(|queue| !queue.trim().is_empty())
+        .ok_or_else(|| anyhow!("[AMQP] delivery carries no reply_to queue"))?;
+
+    let mut props =
+        BasicProperties::default().with_expiration(ShortString::from(REPLY_MESSAGE_TTL));
+    if let Some(correlation) = request.correlation_id() {
+        props = props.with_correlation_id(correlation.clone());
+    }
+
+    Ok((reply_to, props))
+}
+
 fn with_heartbeat(addr: &str) -> String {
     if addr
         .split('?')
@@ -417,6 +500,48 @@ mod tests {
         assert_eq!(
             with_heartbeat("amqp://rabbit/v?heartbeat=10"),
             "amqp://rabbit/v?heartbeat=10"
+        );
+    }
+
+    #[test]
+    fn reply_inherits_the_requesters_correlation_id_and_queue() {
+        let request = BasicProperties::default()
+            .with_reply_to(ShortString::from("amq.gen-Xy7"))
+            .with_correlation_id(ShortString::from("corr-42"));
+
+        let (queue, props) = reply_target(&request).expect("reply_to is present");
+        assert_eq!(queue, "amq.gen-Xy7");
+        assert_eq!(
+            props.correlation_id().as_ref().map(ShortString::as_str),
+            Some("corr-42"),
+            "a reply the requester cannot match is a reply it will never see"
+        );
+        assert_eq!(
+            props.expiration().as_ref().map(ShortString::as_str),
+            Some(REPLY_MESSAGE_TTL),
+            "an orphaned reply must expire rather than pile up"
+        );
+    }
+
+    #[test]
+    fn reply_without_correlation_id_still_routes() {
+        // Fire-and-forget requesters omit the correlation ID; the reply is
+        // still deliverable, it just carries none back.
+        let request = BasicProperties::default().with_reply_to(ShortString::from("replies"));
+        let (queue, props) = reply_target(&request).unwrap();
+        assert_eq!(queue, "replies");
+        assert!(props.correlation_id().is_none());
+    }
+
+    #[test]
+    fn reply_to_a_delivery_with_no_reply_queue_is_an_error() {
+        // Dropping the answer here would leave the requester blocked until its
+        // own timeout with nothing in the logs to explain it.
+        assert!(reply_target(&BasicProperties::default()).is_err());
+        assert!(
+            reply_target(&BasicProperties::default().with_reply_to(ShortString::from("  ")))
+                .is_err(),
+            "a blank reply_to is as unroutable as a missing one"
         );
     }
 
