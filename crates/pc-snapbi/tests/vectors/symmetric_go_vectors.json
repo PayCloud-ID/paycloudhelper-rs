@@ -1,0 +1,51 @@
+{
+  "oracle": "qoinhub Go helpers.SymmetricSignatureGen (RAW body hash path, helpers/signature.go:187-198), called directly via cmd/gen-symmetric-vectors inside the paycloud-be-qoinhubinterface-manager module",
+  "captured_at": "2026-08-17",
+  "note": "Genuine Go oracle vectors. Distinct from symmetric_signatures.json, which is Rust self-consistency data for the MINIFIED layout and says so. Go has three copies of this string-to-sign and only SymmetricSignatureGen is both exported and raw-hashing, so only the raw path can be captured from a real Go entry point; services.SignatureService is an unexported method on a private struct.",
+  "vectors": [
+    {
+      "name": "compact-body",
+      "secret": "test-secret-key",
+      "method": "POST",
+      "url": "/v1.0/qr/qr-mpm-generate",
+      "token": "access-token-abc",
+      "body": "{\"partnerReferenceNo\":\"ORDER-1\",\"amount\":{\"value\":\"1000.00\",\"currency\":\"IDR\"}}",
+      "timestamp": "2026-08-17T10:00:00+07:00",
+      "signature": "swUNJRXghATO8ld5I1tILzUl7OZjRhzAMU/5KQLv25pOiONeXjYWsHApafMFsmJGh4CriWq30Q0A2WyLwx4JEA==",
+      "note": "Already-compact JSON: raw and minified bytes are identical, so Go's raw hash and the Rust port's minified hash MUST agree. This is the vector that proves the live outbound signing path matches."
+    },
+    {
+      "name": "pretty-body",
+      "secret": "test-secret-key",
+      "method": "POST",
+      "url": "/v1.0/qr/qr-mpm-generate",
+      "token": "access-token-abc",
+      "body": "{\n  \"partnerReferenceNo\": \"ORDER-1\",\n  \"amount\": {\n    \"value\": \"1000.00\"\n  }\n}",
+      "timestamp": "2026-08-17T10:00:00+07:00",
+      "signature": "RslG31Wi0aYakSgpjFj3kzN9LOKaVWUbDJEGUqEPEsGr94fzScYw2oniTRsxfoi9q/4vK/Wrq7/rPCD2i8QPfw==",
+      "note": "Pretty-printed JSON: SymmetricSignatureGen hashes the raw whitespace bytes, the Rust port hashes the compacted bytes, so these MUST differ. Pins the known divergence instead of hiding it."
+    },
+    {
+      "name": "invalid-json-body",
+      "secret": "test-secret-key",
+      "method": "POST",
+      "url": "/v1.0/qr/qr-mpm-generate",
+      "token": "access-token-abc",
+      "body": "{invalid}",
+      "timestamp": "2026-08-17T10:00:00+07:00",
+      "signature": "D50J5DCQKgg87pUGV6PJ9nh9YGsHHMviHdOFe3QpDWsuf3oBKSd/ZssbPbYyhCVWWwGNKPJspR/vIJ5fJ25big==",
+      "note": "SymmetricSignatureGen never calls JsonMinify, so it hashes the raw bytes. The Rust port's minify fails and falls back to hashing EMPTY (matching Go's JsonMinify returning []byte{} on error). These MUST differ."
+    },
+    {
+      "name": "empty-body",
+      "secret": "test-secret-key",
+      "method": "POST",
+      "url": "/v1.0/qr/qr-mpm-generate",
+      "token": "access-token-abc",
+      "body": "",
+      "timestamp": "2026-08-17T10:00:00+07:00",
+      "signature": "nWCX0MvJy7JTRZvBR488E+z3Dc8ck2ItbPFrU+RpfRGeFkp3mnQkGv+cczCh6u8nSKoeeL9bdt12k4nht7hVyw==",
+      "note": "Empty body: Go hashes the empty slice. The Rust port's minify also fails on empty input and falls back to empty, so both hash sha256(\"\") and MUST agree."
+    }
+  ]
+}

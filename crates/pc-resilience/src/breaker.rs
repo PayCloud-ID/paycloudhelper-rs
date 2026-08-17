@@ -29,6 +29,12 @@ pub const DEFAULT_COOLDOWN: Duration = Duration::from_secs(30);
 /// * `HalfOpen` — a single probe is allowed; success closes the breaker, any
 ///   failure re-opens it immediately (mirrors the audit publisher resuming only
 ///   after a clean push).
+///
+/// `no-go-equivalent`: Go has **no** half-open state. `AuditPublisher` is a
+/// two-state machine (`circuitOpen` 0/1) whose cooldown goroutine flips it
+/// straight back to closed without probing. `HalfOpen` is an addition of this
+/// port, so its semantics are ours to get right rather than ours to copy — see
+/// [`CircuitBreaker::try_acquire`] for the one-probe-at-a-time rule.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum State {
     Closed,
@@ -78,6 +84,10 @@ struct Inner {
     state: State,
     consecutive_failures: u32,
     opened_at: Option<Instant>,
+    /// When the current `HalfOpen` probe was admitted. `None` outside `HalfOpen`.
+    /// Used to admit exactly one probe, and to recover if that probe never
+    /// reports its outcome.
+    probe_started_at: Option<Instant>,
 }
 
 /// A consecutive-failure circuit breaker.
@@ -118,6 +128,7 @@ impl CircuitBreaker {
                 state: State::Closed,
                 consecutive_failures: 0,
                 opened_at: None,
+                probe_started_at: None,
             }),
         }
     }
@@ -170,13 +181,43 @@ impl CircuitBreaker {
     /// Low-level admission check. Returns `true` if a call is permitted,
     /// transitioning `Open -> HalfOpen` when the cooldown has elapsed.
     /// mirrors: the `circuitOpen.Load() == 1` gate in `Submit`.
+    ///
+    /// # One probe at a time
+    ///
+    /// `HalfOpen` admits **exactly one** in-flight probe. This used to return
+    /// `true` for every caller in `HalfOpen`, which made the probe unbounded: the
+    /// moment the cooldown elapsed, every concurrent caller was released against
+    /// a dependency that had just been failing. The first failure re-opens the
+    /// breaker, so the window is short — but "short window times full request
+    /// rate" is exactly the thundering herd a breaker exists to prevent, and it
+    /// lands on a service that is by definition still fragile.
+    ///
+    /// Go cannot arbitrate this question: it has no half-open state at all. The
+    /// rule is this port's own.
+    ///
+    /// A probe that never reports back (a caller that panicked, or used the
+    /// low-level API and simply dropped the result) would otherwise wedge the
+    /// breaker in `HalfOpen` forever, rejecting everything — a worse outage than
+    /// the one it guards. So a probe older than the cooldown is presumed lost and
+    /// a fresh one is admitted.
     pub fn try_acquire(&self) -> bool {
         let mut g = self.lock();
         match g.state {
-            State::Closed | State::HalfOpen => true,
+            State::Closed => true,
             State::Open => {
                 if g.opened_at.is_none_or(|t| t.elapsed() >= self.cooldown) {
                     g.state = State::HalfOpen;
+                    g.probe_started_at = Some(Instant::now());
+                    true
+                } else {
+                    false
+                }
+            }
+            State::HalfOpen => {
+                if g.probe_started_at
+                    .is_none_or(|t| t.elapsed() >= self.cooldown)
+                {
+                    g.probe_started_at = Some(Instant::now());
                     true
                 } else {
                     false
@@ -192,6 +233,7 @@ impl CircuitBreaker {
         g.consecutive_failures = 0;
         g.state = State::Closed;
         g.opened_at = None;
+        g.probe_started_at = None;
     }
 
     /// Record a failure: increment the counter and open the breaker when the
@@ -203,6 +245,7 @@ impl CircuitBreaker {
         if g.state == State::HalfOpen || g.consecutive_failures >= self.threshold {
             g.state = State::Open;
             g.opened_at = Some(Instant::now());
+            g.probe_started_at = None;
         }
     }
 
@@ -308,6 +351,137 @@ mod tests {
         let _ = cb.call(fail).await;
         assert_eq!(cb.consecutive_failures(), 1);
         assert_eq!(cb.state(), State::Closed);
+    }
+
+    /// The regression this guards. `try_acquire` used to return `true` for every
+    /// caller in `HalfOpen`, so the instant the cooldown elapsed the whole
+    /// backlog was released against a dependency that had just been failing.
+    /// Exactly one probe may go through.
+    #[test]
+    fn half_open_admits_only_one_probe_at_a_time() {
+        let cb = CircuitBreaker::new(1, Duration::from_millis(40));
+        cb.record_failure();
+        assert_eq!(cb.state(), State::Open);
+        std::thread::sleep(Duration::from_millis(60));
+
+        assert!(
+            cb.try_acquire(),
+            "the first caller past the cooldown probes"
+        );
+        assert_eq!(cb.state(), State::HalfOpen);
+        for _ in 0..20 {
+            assert!(
+                !cb.try_acquire(),
+                "a second concurrent caller must not also probe a recovering dependency"
+            );
+        }
+    }
+
+    /// Under real concurrency, not just sequentially: only one thread may hold
+    /// the probe. This is the only behaviour that depends on the `Mutex` being
+    /// correct under contention, and it had no test.
+    #[test]
+    fn concurrent_callers_yield_exactly_one_probe() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::{Arc, Barrier};
+
+        let cb = Arc::new(CircuitBreaker::new(1, Duration::from_millis(40)));
+        cb.record_failure();
+        std::thread::sleep(Duration::from_millis(60));
+
+        let admitted = Arc::new(AtomicUsize::new(0));
+        let barrier = Arc::new(Barrier::new(16));
+        let mut handles = Vec::new();
+        for _ in 0..16 {
+            let (cb, admitted, barrier) =
+                (Arc::clone(&cb), Arc::clone(&admitted), Arc::clone(&barrier));
+            handles.push(std::thread::spawn(move || {
+                barrier.wait();
+                if cb.try_acquire() {
+                    admitted.fetch_add(1, Ordering::SeqCst);
+                }
+            }));
+        }
+        for h in handles {
+            h.join().expect("worker thread");
+        }
+        assert_eq!(
+            admitted.load(Ordering::SeqCst),
+            1,
+            "exactly one of 16 racing callers may be admitted as the probe"
+        );
+    }
+
+    /// A probe that never reports its outcome — a panicking caller, or a
+    /// low-level user who drops the result — must not wedge the breaker in
+    /// `HalfOpen` rejecting everything forever. That would be a worse outage
+    /// than the one the breaker guards against.
+    #[test]
+    fn a_lost_probe_does_not_wedge_the_breaker() {
+        let cb = CircuitBreaker::new(1, Duration::from_millis(40));
+        cb.record_failure();
+        std::thread::sleep(Duration::from_millis(60));
+
+        assert!(cb.try_acquire(), "probe admitted");
+        assert!(
+            !cb.try_acquire(),
+            "second caller rejected while it is in flight"
+        );
+        // The probe never calls record_success/record_failure.
+        std::thread::sleep(Duration::from_millis(60));
+        assert!(
+            cb.try_acquire(),
+            "a probe older than the cooldown is presumed lost and replaced"
+        );
+    }
+
+    /// RC-2 in the state the existing test does not reach: cancelling the probe
+    /// must not be read as the dependency still being broken.
+    #[tokio::test]
+    async fn cancelling_the_probe_does_not_reopen_the_breaker() {
+        let cb = CircuitBreaker::new(1, Duration::from_millis(40));
+        let _ = cb.call(fail).await;
+        assert_eq!(cb.state(), State::Open);
+        tokio::time::sleep(Duration::from_millis(60)).await;
+
+        let r = cb.call(cancel).await;
+        assert!(matches!(r, Err(BreakerError::Inner(TestErr::Cancelled))));
+        assert_eq!(
+            cb.state(),
+            State::HalfOpen,
+            "a cancelled probe is not evidence either way, so the breaker stays probing"
+        );
+        assert_eq!(
+            cb.consecutive_failures(),
+            1,
+            "unchanged by the cancellation"
+        );
+    }
+
+    /// `Open -> HalfOpen -> success -> Closed`, asserted on the state machine
+    /// rather than only on the returned value.
+    #[tokio::test]
+    async fn a_successful_probe_closes_the_breaker() {
+        let cb = CircuitBreaker::new(1, Duration::from_millis(40));
+        let _ = cb.call(fail).await;
+        tokio::time::sleep(Duration::from_millis(60)).await;
+
+        assert_eq!(cb.call(ok).await.ok(), Some(1));
+        assert_eq!(cb.state(), State::Closed);
+        assert_eq!(cb.consecutive_failures(), 0);
+        // And the breaker is fully usable again, not still holding a probe slot.
+        assert!(cb.try_acquire());
+    }
+
+    /// A zero threshold would otherwise mean "trip on nothing" — or, read the
+    /// other way, "never trip". Go's option guards only apply positive values;
+    /// this clamps instead.
+    #[test]
+    fn threshold_zero_is_clamped_to_one() {
+        let cb = CircuitBreaker::new(0, Duration::from_secs(30));
+        assert_eq!(cb.threshold, 1);
+        cb.record_failure();
+        assert_eq!(cb.state(), State::Open, "one failure must be enough");
     }
 
     #[tokio::test]

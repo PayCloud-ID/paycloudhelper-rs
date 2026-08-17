@@ -1,0 +1,16 @@
+[package]
+name = "xtask"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+[lints]
+workspace = true
+
+# Deliberately zero dependencies. This is a guard against port drift; a guard
+# that drags `syn`/`proc-macro2` into `cargo deny` and `cargo audit` for every
+# CI run has a worse cost/benefit than the thing it guards.
+[dependencies]

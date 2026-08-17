@@ -98,6 +98,11 @@ fn symmetric_string_to_sign(method: &str, url: &str, token: &str, body: &[u8], t
 /// `helpers.SymmetricSignatureGen` (raw body). See
 /// [`symmetric_string_to_sign`] for why one function covers both and what would
 /// break that.
+/// mirrors: `services.SignatureService` + `helpers.SymmetricSignatureGen`
+///
+/// **Two** Go counterparts, and they disagree on the body hash. Comparing this
+/// against only `SymmetricSignatureGen` is what produced a recommendation to drop
+/// the minify — which would have broken the other one. Keep both names here.
 pub fn symmetric_sign(
     secret: &[u8],
     method: &str,
@@ -119,6 +124,7 @@ pub fn symmetric_sign(
 /// Go: `helpers.ValidateSignatureSnap` (which uses `hmac.Equal`). The
 /// provided base64 signature is decoded and compared against the freshly
 /// computed MAC using a constant-time comparison ([`subtle`]).
+/// mirrors: `helpers.ValidateSignatureSnap`
 pub fn symmetric_verify(
     secret: &[u8],
     method: &str,
@@ -156,6 +162,7 @@ fn asymmetric_string_to_sign(client_key: &str, ts: &str) -> String {
 /// (`rsaPrivateKey.Sign`). Private key is parsed as **PKCS#1**, the message
 /// `client_key|ts` is hashed with SHA-256 and signed with RSA PKCS#1 v1.5;
 /// the result is `base64.StdEncoding`.
+/// mirrors: `helpers.SignatureGenerate` + `services.SignatureGenerate`
 pub fn rsa_sign(priv_pem: &str, client_key: &str, ts: &str) -> Result<String> {
     let key = private_key_from_pem(priv_pem)?;
     let signing_key = SigningKey::<Sha256>::new(key);
@@ -169,6 +176,7 @@ pub fn rsa_sign(priv_pem: &str, client_key: &str, ts: &str) -> Result<String> {
 /// Go: `helpers.ValidateSignature` (`rsaPublicKey.unsign`). Public key is
 /// parsed as **PKIX/SPKI**, message is `client_key|ts` hashed with SHA-256,
 /// signature is base64-decoded and checked with RSA PKCS#1 v1.5.
+/// mirrors: `helpers.ValidateSignature`
 pub fn rsa_verify(pub_pem: &str, client_key: &str, ts: &str, sig_b64: &str) -> Result<bool> {
     let key = public_key_from_pem(pub_pem)?;
     let verifying_key = VerifyingKey::<Sha256>::new(key);
@@ -191,6 +199,7 @@ pub fn rsa_verify(pub_pem: &str, client_key: &str, ts: &str, sig_b64: &str) -> R
 /// Go: `adicrypto.PEMBytesToPublicKey` → `x509.ParsePKIXPublicKey`, and the
 /// `parsePublicKey` helpers which accept only the `PUBLIC KEY` block type.
 /// The Go code has no PKCS#1 fallback, so neither does this.
+/// mirrors: `adicrypto.PEMBytesToPublicKey` + `helpers.BytesToPublicKey`
 pub fn public_key_from_pem(pem: &str) -> Result<RsaPublicKey> {
     RsaPublicKey::from_public_key_pem(pem).context("failed to parse PKIX/SPKI RSA public key")
 }
@@ -200,6 +209,7 @@ pub fn public_key_from_pem(pem: &str) -> Result<RsaPublicKey> {
 /// Go: `helpers.parsePrivateKey` / `helpers.ValidatePrivateKey` →
 /// `x509.ParsePKCS1PrivateKey`, which accept only the `RSA PRIVATE KEY`
 /// block type. The Go code has no PKCS#8 fallback, so neither does this.
+/// mirrors: `helpers.parsePrivateKey` + `helpers.ValidatePrivateKey`
 pub fn private_key_from_pem(pem: &str) -> Result<RsaPrivateKey> {
     RsaPrivateKey::from_pkcs1_pem(pem).context("failed to parse PKCS#1 RSA private key")
 }
@@ -225,6 +235,7 @@ fn derive_aes_key(key: &[u8]) -> [u8; 32] {
 ///
 /// Go: `helpers.EncryptAES`. Output is `base64.StdEncoding(nonce ‖ ciphertext)`
 /// where `ciphertext` already carries the GCM tag appended (as Go's `Seal` does).
+/// mirrors: `helpers.EncryptAES` + `helpers.getAESKey`
 pub fn encrypt_aes(key: &[u8], plaintext: &str) -> Result<String> {
     let derived = derive_aes_key(key);
     let cipher = Aes256Gcm::new_from_slice(&derived).map_err(|e| anyhow!("aes init: {e}"))?;
@@ -249,6 +260,7 @@ pub fn encrypt_aes(key: &[u8], plaintext: &str) -> Result<String> {
 /// input is not valid base64 but *is* a valid PKCS#1 PEM RSA private key, the
 /// input is returned unchanged (Go returns the raw key when base64 decoding
 /// fails at byte 0 and `ValidatePrivateKey` succeeds).
+/// mirrors: `helpers.DecryptAES`
 pub fn decrypt_aes(key: &[u8], input: &str) -> Result<String> {
     let raw = match B64.decode(input) {
         Ok(raw) => raw,
@@ -291,6 +303,7 @@ pub fn decrypt_aes(key: &[u8], input: &str) -> Result<String> {
 /// and [`verify_jwt_rs256`] validates it when it is. It simply is not captured
 /// as a field here; like every other claim, it lands in `extra`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+/// mirrors: the `jwt.MapClaims` consumed by `middlewares.GetTokenClaims`
 pub struct Claims {
     /// The `Expired` string claim (Go layout `2006-01-02 15:04:05`).
     #[serde(rename = "Expired", default)]
@@ -312,6 +325,7 @@ pub struct Claims {
 /// carry the custom [`Claims::expired`] string instead, and interpreting that
 /// (along with revocation) remains the caller's job, exactly as Go does it
 /// outside the parse callback.
+/// mirrors: `middlewares.GetTokenClaims` + `paycloudhelper.RevokeToken`
 pub fn verify_jwt_rs256(pub_pem: &str, token: &str) -> Result<Claims> {
     let key = DecodingKey::from_rsa_pem(pub_pem.as_bytes())
         .context("failed to build RS256 decoding key from PEM")?;

@@ -2321,6 +2321,7 @@ dependencies = [
  "pc-core",
  "pc-json",
  "pc-log",
+ "pc-resilience",
  "serde",
  "serde_json",
  "time",
@@ -4738,6 +4739,10 @@ dependencies = [
  "thiserror 2.0.19",
  "time",
 ]
+
+[[package]]
+name = "xtask"
+version = "1.0.3"
 
 [[package]]
 name = "yoke"
