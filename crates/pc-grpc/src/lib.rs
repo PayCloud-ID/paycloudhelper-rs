@@ -41,6 +41,15 @@ use tonic::transport::{Certificate, Channel, ClientTlsConfig, Endpoint};
 /// the `maxConn <= 0 { maxConn = 2 }` clamp in `NewGrpcClientPool`).
 pub const DEFAULT_MAX_POOL: usize = 2;
 
+// Defaults for the settings this crate parses but does not yet act on. Named
+// so `from_env` and `warn_inert_settings` share one source of truth — a check
+// carrying its own copy of a default drifts the moment either is edited.
+const DEFAULT_HEALTHCHECK_INTERVAL_SECS: u64 = 120;
+const DEFAULT_HEALTHCHECK_ENABLED: bool = true;
+const DEFAULT_BACKOFF_MULTIPLIER: f64 = 2.0;
+const DEFAULT_MAX_IDLE_MINUTES: u64 = 30;
+const DEFAULT_MAX_LIFE_HOURS: u64 = 24;
+
 /// Margin subtracted from a wall-clock budget to derive a child deadline.
 ///
 /// The RC-1 timeout-budget rule: a child call's deadline must be *strictly*
@@ -111,12 +120,21 @@ impl GrpcConfig {
     ///
     /// mirrors: `helpers.Load` (gRPC fields) + `ApplyGrpcEnvConfig`.
     pub fn from_env() -> Self {
+        let config = Self::parse_env();
+        config.warn_inert_settings();
+        config
+    }
+
+    fn parse_env() -> Self {
         Self {
             transaction_max_pool: env_parsed("GRPC_TRANSACTION_MAX_POOL", DEFAULT_MAX_POOL),
             merchant_max_pool: env_parsed("GRPC_MERCHANT_MAX_POOL", DEFAULT_MAX_POOL),
             config_max_pool: env_parsed("GRPC_CONFIG_MAX_POOL", DEFAULT_MAX_POOL),
-            healthcheck_interval_secs: env_parsed("GRPC_HEALTHCHECK_INTERVAL", 120_u64),
-            healthcheck_enabled: env_bool("GRPC_HEALTHCHECK", true),
+            healthcheck_interval_secs: env_parsed(
+                "GRPC_HEALTHCHECK_INTERVAL",
+                DEFAULT_HEALTHCHECK_INTERVAL_SECS,
+            ),
+            healthcheck_enabled: env_bool("GRPC_HEALTHCHECK", DEFAULT_HEALTHCHECK_ENABLED),
             grpc_port: env_string("GRPC_PORT", "9333"),
             tls_mode: if env_string("GRPC_TLS_MODE", "") == "tls" {
                 TlsMode::Tls
@@ -133,9 +151,61 @@ impl GrpcConfig {
             max_retries: env_parsed("GRPC_MAX_RETRIES", 3_u32),
             initial_backoff: Duration::from_millis(env_parsed("GRPC_INITIAL_BACKOFF", 100_u64)),
             max_backoff: Duration::from_secs(env_parsed("GRPC_MAX_BACKOFF", 30_u64)),
-            backoff_multiplier: env_parsed("GRPC_BACKOFF_MULTIPLIER", 2.0_f64),
-            max_idle: Duration::from_secs(env_parsed::<u64>("GRPC_MAX_IDLE", 30) * 60),
-            max_life: Duration::from_secs(env_parsed::<u64>("GRPC_MAX_LIFE", 24) * 3_600),
+            backoff_multiplier: env_parsed("GRPC_BACKOFF_MULTIPLIER", DEFAULT_BACKOFF_MULTIPLIER),
+            max_idle: Duration::from_secs(
+                env_parsed::<u64>("GRPC_MAX_IDLE", DEFAULT_MAX_IDLE_MINUTES) * 60,
+            ),
+            max_life: Duration::from_secs(
+                env_parsed::<u64>("GRPC_MAX_LIFE", DEFAULT_MAX_LIFE_HOURS) * 3_600,
+            ),
+        }
+    }
+
+    /// Warn about settings that are parsed and stored but never acted on.
+    ///
+    /// Five `GRPC_*` variables are read here, kept on the struct, asserted in
+    /// tests — and then no code reads them. Implementing five features is not a
+    /// parity pass's job, but silently accepting `GRPC_HEALTHCHECK=false` and
+    /// then behaving identically is the kind of thing that costs an afternoon
+    /// and ends with someone concluding the config system is broken. A line at
+    /// construction turns a silent no-op into a visible one.
+    ///
+    /// Only **non-default** values warn. A default is what the code does anyway,
+    /// so warning about it would put five lines in every boot log and train
+    /// everyone to skip them.
+    fn warn_inert_settings(&self) {
+        let mut inert: Vec<String> = Vec::new();
+        if self.healthcheck_interval_secs != DEFAULT_HEALTHCHECK_INTERVAL_SECS {
+            inert.push(format!(
+                "GRPC_HEALTHCHECK_INTERVAL={}",
+                self.healthcheck_interval_secs
+            ));
+        }
+        if self.healthcheck_enabled != DEFAULT_HEALTHCHECK_ENABLED {
+            inert.push(format!("GRPC_HEALTHCHECK={}", self.healthcheck_enabled));
+        }
+        // Exact comparison is right here: the question is "did an operator set
+        // this?", and any value that round-trips to something other than the
+        // literal default came from the environment.
+        if self.backoff_multiplier != DEFAULT_BACKOFF_MULTIPLIER {
+            inert.push(format!(
+                "GRPC_BACKOFF_MULTIPLIER={}",
+                self.backoff_multiplier
+            ));
+        }
+        if self.max_idle != Duration::from_secs(DEFAULT_MAX_IDLE_MINUTES * 60) {
+            inert.push(format!("GRPC_MAX_IDLE={:?}", self.max_idle));
+        }
+        if self.max_life != Duration::from_secs(DEFAULT_MAX_LIFE_HOURS * 3_600) {
+            inert.push(format!("GRPC_MAX_LIFE={:?}", self.max_life));
+        }
+
+        if !inert.is_empty() {
+            tracing::warn!(
+                settings = %inert.join(" "),
+                "[GrpcConfig] these gRPC settings are parsed but not implemented yet \
+                 and will have no effect"
+            );
         }
     }
 }
@@ -320,12 +390,37 @@ impl GrpcClientFactory {
 
     /// Backoff before retry `attempt` (1-based), capped at `max_backoff`.
     ///
-    /// mirrors: `createConnection`'s `attempt*attempt*100ms`-style growth,
-    /// clamped by `MaxBackoff`.
+    /// mirrors: `createConnection`'s `time.Duration(attempt*attempt*100) *
+    /// time.Millisecond` (`app/grpc_pool.go:562`) — **quadratic**, not linear.
+    /// This grew linearly while its own doc claimed to mirror the quadratic
+    /// curve, so at the default 100ms base a 3-attempt prewarm waited
+    /// 100/200/300ms where Go waits 100/400/900ms.
+    ///
+    /// Two deliberate differences from Go, both harmless: Go hardcodes the 100ms
+    /// base here (its `InitialBackoff` field feeds a different mechanism, the
+    /// grpc service-config retry policy at `grpc_pool.go:361`), whereas this
+    /// scales the configured `initial_backoff` — identical at the default. And
+    /// Go applies no ceiling to this loop, because with 3 attempts it never
+    /// needs one; the `max_backoff` clamp is kept as a guard for anyone who
+    /// raises `GRPC_MAX_RETRIES`.
     fn backoff_for(&self, attempt: u32) -> Duration {
-        let scaled = self.config.initial_backoff.saturating_mul(attempt);
-        scaled.min(self.config.max_backoff)
+        backoff_curve(
+            self.config.initial_backoff,
+            self.config.max_backoff,
+            attempt,
+        )
     }
+}
+
+/// `initial × attempt²`, clamped to `max` (pure — testable without a pool).
+///
+/// Split out because the linear-vs-quadratic bug lived here undetected: there
+/// was no test, and the only statement of intent was a doc comment that
+/// disagreed with the code.
+fn backoff_curve(initial: Duration, max: Duration, attempt: u32) -> Duration {
+    initial
+        .saturating_mul(attempt.saturating_mul(attempt))
+        .min(max)
 }
 
 /// Format the DNS target the pool dials.
@@ -419,6 +514,30 @@ mod tests {
 
     // Serialises tests that mutate process-global environment variables.
     static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    /// Go: `time.Duration(attempt*attempt*100) * time.Millisecond`
+    /// (`app/grpc_pool.go:562`). At the default 100ms base a 3-attempt prewarm
+    /// must wait 100/400/900ms; it waited 100/200/300ms, because the growth was
+    /// linear while the doc comment claimed to mirror the quadratic curve.
+    #[test]
+    fn backoff_matches_go_quadratic_curve() {
+        let initial = Duration::from_millis(100);
+        let max = Duration::from_secs(30);
+        assert_eq!(backoff_curve(initial, max, 1), Duration::from_millis(100));
+        assert_eq!(backoff_curve(initial, max, 2), Duration::from_millis(400));
+        assert_eq!(backoff_curve(initial, max, 3), Duration::from_millis(900));
+    }
+
+    /// Go's loop is capped at 3 attempts so it never needs a ceiling; this crate
+    /// keeps one for anyone who raises `GRPC_MAX_RETRIES`, and it must hold even
+    /// where `attempt²` would overflow.
+    #[test]
+    fn backoff_is_clamped_and_cannot_overflow() {
+        let initial = Duration::from_millis(100);
+        let max = Duration::from_secs(30);
+        assert_eq!(backoff_curve(initial, max, 100), max, "100²×100ms > 30s");
+        assert_eq!(backoff_curve(initial, max, u32::MAX), max);
+    }
 
     #[test]
     fn dial_target_joins_name_and_port_without_suffix() {
