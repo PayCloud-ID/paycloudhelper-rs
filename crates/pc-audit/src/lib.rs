@@ -659,4 +659,41 @@ mod tests {
         assert_eq!(publisher.consecutive_failures(), 10);
         publisher.stop().await;
     }
+
+    /// There are **two** independent circuit breakers in this workspace, and
+    /// nothing previously stopped them drifting apart.
+    ///
+    /// Go has one breaker, embedded in `AuditPublisher`
+    /// (`audittrail_publisher.go:27-30`). The Rust port produced two: this
+    /// crate's inline atomics — the one that actually runs in production — and
+    /// the general-purpose [`pc_resilience::CircuitBreaker`], which as of today
+    /// has **zero callers** and exists for the next service to adopt.
+    ///
+    /// `pc-audit` does not depend on `pc-resilience` (that would be a needless
+    /// edge for a hot atomic path), so the compiler cannot relate them. This
+    /// guard does: if someone retunes one set of defaults, they are told the
+    /// other exists rather than discovering it during an incident.
+    ///
+    /// If they are ever *intentionally* different, change this test and say why
+    /// — that is the point of it failing.
+    #[test]
+    fn the_two_rust_breakers_agree_with_go_and_each_other() {
+        let audit = AuditPublisherConfig::default();
+
+        // Go: `maxConsecFailures: 10`, `cooldownDuration: 30 * time.Second`
+        // (`audittrail_publisher.go:113-114`).
+        assert_eq!(audit.circuit_breaker_threshold, 10);
+        assert_eq!(audit.circuit_breaker_cooldown, Duration::from_secs(30));
+
+        assert_eq!(
+            u32::try_from(audit.circuit_breaker_threshold).unwrap(),
+            pc_resilience::DEFAULT_THRESHOLD,
+            "the two Rust breakers disagree on the failure threshold"
+        );
+        assert_eq!(
+            audit.circuit_breaker_cooldown,
+            pc_resilience::DEFAULT_COOLDOWN,
+            "the two Rust breakers disagree on the cooldown"
+        );
+    }
 }

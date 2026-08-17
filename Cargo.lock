@@ -2321,6 +2321,7 @@ dependencies = [
  "pc-core",
  "pc-json",
  "pc-log",
+ "pc-resilience",
  "serde",
  "serde_json",
  "time",

@@ -20,3 +20,8 @@ serde.workspace = true
 serde_json.workspace = true
 tokio.workspace = true
 time.workspace = true
+
+[dev-dependencies]
+# Test-only: the parity guard below compares this crate's inline breaker against
+# the general-purpose one. Deliberately NOT a real dependency — see the guard.
+pc-resilience.workspace = true

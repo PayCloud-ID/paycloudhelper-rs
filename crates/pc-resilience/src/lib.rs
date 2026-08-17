@@ -19,6 +19,13 @@ mod breaker;
 mod ratelimit;
 mod singleflight;
 
-pub use breaker::{BreakerError, Cancellable, CircuitBreaker, State};
+// `DEFAULT_THRESHOLD` / `DEFAULT_COOLDOWN` are documented `pub const`s that were
+// unreachable: `breaker` is a private module and only the types were re-exported.
+// They are the Go-derived defaults, so anything comparing its own tuning against
+// them — as `pc-audit`'s cross-breaker parity guard does — has to be able to name
+// them.
+pub use breaker::{
+    BreakerError, Cancellable, CircuitBreaker, State, DEFAULT_COOLDOWN, DEFAULT_THRESHOLD,
+};
 pub use ratelimit::KeyedRateLimiter;
 pub use singleflight::Singleflight;
