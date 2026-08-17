@@ -67,8 +67,15 @@ fn forwarding() -> &'static RwLock<Option<Forwarding>> {
 /// The formatted message is shared with stdout; no second formatting pass is
 /// performed, so literal percent signs cannot diverge between the two sinks.
 pub fn configure_log_forwarding(hook: Forwarder) {
+    // Go's `strconv.ParseBool` grammar, shared via `pc-core`. The previous
+    // `eq_ignore_ascii_case("true")` disagreed with it in both directions:
+    // `LOG_FORWARD_ERROR=1` read as **false** and silently turned a default-on
+    // level off, while `tRuE` read as true where Go rejects it. An unparseable
+    // value now keeps the documented default rather than collapsing to false.
     let enabled = |name: &str, default: bool| {
-        std::env::var(name).map_or(default, |value| value.eq_ignore_ascii_case("true"))
+        std::env::var(name).map_or(default, |value| {
+            pc_core::parse_bool_go(&value).unwrap_or(default)
+        })
     };
     let mut levels = 0;
     for (name, default, flag) in [

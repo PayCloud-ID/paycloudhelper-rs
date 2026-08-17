@@ -347,11 +347,27 @@ impl AuditPublisher {
                     let Some(payload) = rx.lock().await.recv().await else {
                         break;
                     };
+                    // Both branches below discard an already-dequeued message.
+                    // That is the worst place to be silent: the record has left
+                    // the queue, so it is gone for good, and `submit` already
+                    // returned true to a caller that believes it was accepted.
                     if now_millis() < open_until_ms.load(Ordering::Acquire) {
+                        pc_log::log_w_rated!(
+                            "audit-worker-drop-breaker",
+                            "[AuditPublisher]",
+                            "discarding dequeued audit id={} circuit breaker open",
+                            payload.id
+                        );
                         continue;
                     }
                     if !client.ready() {
                         record_failure(&failures, &open_until_ms, threshold, cooldown);
+                        pc_log::log_w_rated!(
+                            "audit-worker-drop-notready",
+                            "[AuditPublisher]",
+                            "discarding dequeued audit id={} broker connection not ready",
+                            payload.id
+                        );
                         continue;
                     }
                     let bytes = match pc_json::marshal_audit(&payload) {
@@ -402,11 +418,51 @@ impl AuditPublisher {
 
     /// Queue a message without blocking. Returns false when stopped, full, or
     /// while the breaker is open.
+    ///
+    /// Every `false` is logged. An audit trail that silently stops recording is
+    /// worse than one that fails loudly: the caller treats the boolean as
+    /// advisory (nothing in the fleet checks it), so without a line here the
+    /// only symptom is records missing from a table nobody watches in real time.
+    /// The three causes need different responses — a stopped publisher is
+    /// shutdown, an open breaker is a broker problem, a full queue is capacity —
+    /// so they are logged separately rather than as one generic drop.
+    ///
+    /// Rate-limited, because the failure modes that trigger this are exactly the
+    /// ones that would repeat at full request rate.
     pub fn submit(&self, payload: MessagePayloadAudit) -> bool {
-        if self.stopped.load(Ordering::Acquire) || self.circuit_open() {
+        let id = payload.id;
+        if self.stopped.load(Ordering::Acquire) {
+            pc_log::log_w_rated!(
+                "audit-drop-stopped",
+                "[AuditPublisher]",
+                "dropping audit id={} publisher stopped",
+                id
+            );
             return false;
         }
-        self.tx.try_send(payload).is_ok()
+        if self.circuit_open() {
+            pc_log::log_w_rated!(
+                "audit-drop-breaker",
+                "[AuditPublisher]",
+                "dropping audit id={} circuit breaker open consecutive_failures={}",
+                id,
+                self.consecutive_failures()
+            );
+            return false;
+        }
+        match self.tx.try_send(payload) {
+            Ok(()) => true,
+            Err(error) => {
+                pc_log::log_w_rated!(
+                    "audit-drop-full",
+                    "[AuditPublisher]",
+                    "dropping audit id={} queue full error={}",
+                    id,
+                    error
+                );
+                false
+            }
+        }
     }
 
     #[must_use]

@@ -2381,6 +2381,7 @@ name = "pc-grpc"
 version = "1.0.3"
 dependencies = [
  "anyhow",
+ "pc-core",
  "tokio",
  "tonic",
  "tracing",

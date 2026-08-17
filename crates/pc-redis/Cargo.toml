@@ -23,6 +23,9 @@ serde.workspace = true
 serde_json.workspace = true
 anyhow.workspace = true
 tracing.workspace = true
+# Runtime dependency, not just a test one: every command is bounded by
+# `tokio::time::timeout` so a stalled broker cannot hang the caller forever.
+tokio = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true }

@@ -11,6 +11,7 @@ description = "tonic gRPC client-pool factory — DNS round-robin pool, prewarm,
 workspace = true
 
 [dependencies]
+pc-core.workspace = true
 tonic.workspace = true
 tokio.workspace = true
 anyhow.workspace = true
