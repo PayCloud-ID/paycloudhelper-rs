@@ -168,20 +168,52 @@ impl AmqpClient {
         let connection = Connection::connect(&addr, props)
             .await
             .with_context(|| format!("connect AMQP {}", redact_amqp_uri(&addr)))?;
-        let channel = connection.create_channel().await?;
+        let mut channel = connection.create_channel().await?;
         channel
             .confirm_select(ConfirmSelectOptions::default())
             .await?;
-        channel
-            .queue_declare(
-                &self.queue,
-                QueueDeclareOptions {
-                    durable: true,
-                    ..Default::default()
-                },
-                FieldTable::default(),
-            )
-            .await?;
+
+        // Probe with a PASSIVE declare and create the queue only when it is
+        // genuinely absent.
+        //
+        // WHY: an active `queue_declare` asserts the queue's arguments, so
+        // attaching to a queue somebody else already created with a
+        // dead-letter exchange, a TTL or a max-length is an AMQP 406
+        // PRECONDITION_FAILED:
+        //
+        //   inequivalent arg 'x-dead-letter-exchange' for queue
+        //   'pg-q-audittrail-trx': received none but current is
+        //   'pg-exch-audittrail-trx-dlq'
+        //
+        // A passive declare only asks "does this exist?" and ignores
+        // arguments, so a client that does not own the queue never fights the
+        // owner over its topology. This mirrors the Go helper, which has
+        // always done it this way (paycloudhelper amqp.go:287-346) — the Rust
+        // port dropped the probe, which is what made this a bug rather than a
+        // difference. It cost a service CrashLoopBackOff in staging before it
+        // was found.
+        if channel
+            .queue_declare(&self.queue, passive_probe_options(), FieldTable::default())
+            .await
+            .is_err()
+        {
+            // A failed passive declare closes the channel (AMQP 404 is a
+            // channel-error), so the fallback MUST run on a fresh one — the
+            // Go helper reopens it here for exactly the same reason. Reusing
+            // the closed channel fails with a confusing "channel is closed"
+            // that hides the real cause.
+            tracing::info!(
+                queue = %self.queue,
+                "[AMQP] queue does not exist, declaring"
+            );
+            channel = connection.create_channel().await?;
+            channel
+                .confirm_select(ConfirmSelectOptions::default())
+                .await?;
+            channel
+                .queue_declare(&self.queue, declare_options(), FieldTable::default())
+                .await?;
+        }
 
         let state = Arc::new(BrokerState {
             connection,
@@ -464,6 +496,27 @@ fn with_heartbeat(addr: &str) -> String {
 
 /// Redact credentials from an AMQP URI before logging.
 #[must_use]
+/// Options for the existence probe: `passive` makes the broker answer "does this
+/// queue exist?" **without** comparing arguments, so it can never raise
+/// PRECONDITION_FAILED against a queue whose owner declared it with a
+/// dead-letter exchange, a TTL, or any other argument.
+fn passive_probe_options() -> QueueDeclareOptions {
+    QueueDeclareOptions {
+        passive: true,
+        durable: true,
+        ..Default::default()
+    }
+}
+
+/// Options for actually creating the queue, used only when the probe shows it is
+/// absent. Must NOT be passive — this is the branch that creates it.
+fn declare_options() -> QueueDeclareOptions {
+    QueueDeclareOptions {
+        durable: true,
+        ..Default::default()
+    }
+}
+
 pub fn redact_amqp_uri(uri: &str) -> String {
     let Some((scheme, rest)) = uri.split_once("://") else {
         return uri.to_string();
@@ -485,6 +538,47 @@ mod tests {
             "amqp://***:***@rabbit:5672/vhost"
         );
         assert_eq!(redact_amqp_uri("amqp://rabbit/v"), "amqp://rabbit/v");
+    }
+
+    /// The regression this guards: the connect path used to declare
+    /// unconditionally and non-passively, which is an AMQP 406 against any
+    /// pre-existing queue that carries arguments. The probe must be passive.
+    #[test]
+    fn existence_probe_is_passive() {
+        let probe = passive_probe_options();
+        assert!(
+            probe.passive,
+            "the probe must be passive or it asserts arguments it does not own"
+        );
+        assert!(
+            probe.durable,
+            "the probe must match the durability we expect"
+        );
+    }
+
+    /// The create branch must NOT be passive — a passive declare cannot create.
+    #[test]
+    fn declare_branch_creates_rather_than_probes() {
+        let declare = declare_options();
+        assert!(
+            !declare.passive,
+            "a passive declare cannot create the queue"
+        );
+        assert!(declare.durable);
+    }
+
+    /// Probe and create are different operations and must not be conflated:
+    /// using one set for both reintroduces either the 406 or a queue that is
+    /// never created.
+    #[test]
+    fn probe_and_declare_differ_only_in_passive() {
+        let probe = passive_probe_options();
+        let declare = declare_options();
+        assert_ne!(probe.passive, declare.passive);
+        assert_eq!(probe.durable, declare.durable);
+        assert_eq!(probe.exclusive, declare.exclusive);
+        assert_eq!(probe.auto_delete, declare.auto_delete);
+        assert_eq!(probe.nowait, declare.nowait);
     }
 
     #[test]
