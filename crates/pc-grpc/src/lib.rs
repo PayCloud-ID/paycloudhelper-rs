@@ -399,13 +399,15 @@ fn env_string(key: &str, default: &str) -> String {
 
 /// Read `key` as a bool (Go `strconv.ParseBool` grammar), falling back to
 /// `default` when unset, empty or invalid.
+///
+/// The grammar itself lives in [`pc_core::parse_bool_go`] so this crate and
+/// `pc-log` cannot drift apart on what `1` means. The `.trim()` is this crate's
+/// own tolerance, preserved from the original: deploy values arrive through
+/// compose and `env-data` files, where a trailing space is easy to introduce and
+/// invisible in review.
 fn env_bool(key: &str, default: bool) -> bool {
     match std::env::var(key) {
-        Ok(v) => match v.trim() {
-            "1" | "t" | "T" | "TRUE" | "true" | "True" => true,
-            "0" | "f" | "F" | "FALSE" | "false" | "False" => false,
-            _ => default,
-        },
+        Ok(v) => pc_core::parse_bool_go(v.trim()).unwrap_or(default),
         Err(_) => default,
     }
 }

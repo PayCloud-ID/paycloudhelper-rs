@@ -48,6 +48,29 @@ impl AppEnv {
     }
 }
 
+/// Parse a string with Go's `strconv.ParseBool` grammar.
+///
+/// mirrors: `strconv.ParseBool` — accepts exactly `1 t T TRUE true True` and
+/// `0 f F FALSE false False`, and **nothing else**. `None` is the caller's cue
+/// to apply its own default, the way Go's `err != nil` branch does.
+///
+/// Lives here rather than in each consumer because the same env flags are read
+/// by more than one crate, and a private near-copy that accepts a different set
+/// of spellings is how `LOG_FORWARD_WARN=1` comes to mean `true` in one crate
+/// and `false` in another.
+///
+/// Does **not** trim, because Go does not: a value with stray whitespace fails
+/// to parse and falls back to the default. Callers that want to tolerate
+/// whitespace should `.trim()` at the call site and say why.
+#[must_use]
+pub fn parse_bool_go(value: &str) -> Option<bool> {
+    match value {
+        "1" | "t" | "T" | "TRUE" | "true" | "True" => Some(true),
+        "0" | "f" | "F" | "FALSE" | "false" | "False" => Some(false),
+        _ => None,
+    }
+}
+
 /// Log module prefix constant. mirrors: `phhelper.LogModulePrefix = "pchelper"`.
 pub const LOG_MODULE_PREFIX: &str = "pchelper";
 
@@ -123,5 +146,27 @@ mod tests {
         assert_eq!(AppEnv::parse("prod"), Some(AppEnv::Production));
         assert_eq!(AppEnv::parse("qa"), None);
         assert_eq!(AppEnv::Production.as_str(), "production");
+    }
+
+    #[test]
+    fn parse_bool_go_accepts_exactly_the_go_grammar() {
+        for truthy in ["1", "t", "T", "TRUE", "true", "True"] {
+            assert_eq!(parse_bool_go(truthy), Some(true), "{truthy}");
+        }
+        for falsy in ["0", "f", "F", "FALSE", "false", "False"] {
+            assert_eq!(parse_bool_go(falsy), Some(false), "{falsy}");
+        }
+    }
+
+    /// The spellings Go rejects. `"yes"`/`"on"` look obviously boolean and are
+    /// not; `"tRuE"` is the one that bites, because an `eq_ignore_ascii_case`
+    /// near-copy accepts it while Go does not.
+    #[test]
+    fn parse_bool_go_rejects_everything_else() {
+        for invalid in [
+            "", " ", "yes", "no", "on", "off", "tRuE", "2", "-1", " true",
+        ] {
+            assert_eq!(parse_bool_go(invalid), None, "{invalid:?}");
+        }
     }
 }
