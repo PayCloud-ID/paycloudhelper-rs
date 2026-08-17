@@ -18,6 +18,9 @@
 //!   millisecond-domain [`clamp_ttl_with_max`], which the public wrapper calls.
 //! - A redis-nil (key miss) is quiet: [`RedisPool::get`] returns `Ok(None)`,
 //!   never an error, matching Go's `GetRedis` returning `("", nil)`.
+//! - Go derives its 1000ms `DefaultRedisTimeout` from a caller-supplied
+//!   `redis.Options.ReadTimeout`; this port builds its pool from env, so the
+//!   deadline is an env var ([`op_timeout`]) with the same default.
 
 use std::fmt::Display;
 use std::time::Duration;
@@ -219,6 +222,51 @@ pub fn trx_backoff() -> Duration {
     Duration::from_millis(u64::try_from(ms).unwrap_or(10))
 }
 
+// ---------------------------------------------------------------------------
+// Per-operation timeout (Go: DefaultRedisTimeout).
+// ---------------------------------------------------------------------------
+
+/// Default per-operation deadline: 1000ms.
+///
+/// mirrors: Go's `DefaultRedisTimeout = 1000 * time.Millisecond`, which every
+/// command in `redis.go` applies via `context.WithTimeout(..., DefaultRedisTimeout)`.
+const DEFAULT_OP_TIMEOUT_MS: i64 = 1_000;
+
+/// Clamp math for the per-operation deadline (pure, injectable — env-race-free).
+///
+/// A non-positive or unparseable value falls back to the default: a zero or
+/// negative deadline would abort every command instantly, which is a worse
+/// failure than the unbounded wait this exists to prevent.
+fn op_timeout_ms_from(parsed: Option<i64>) -> i64 {
+    match parsed {
+        Some(v) if v > 0 => v,
+        _ => DEFAULT_OP_TIMEOUT_MS,
+    }
+}
+
+/// The default lock TTL must outlive the acquire deadline, or a lock could
+/// expire before the holder ever learns it owns anything. Checked at compile
+/// time so changing either constant in isolation fails the build, not a test.
+///
+/// This constrains the *defaults* only. `MIN_LOCK_TIMEOUT_MS` (700) sits below
+/// the deadline, so an operator setting `TRANSACTION_REDIS_LOCK_TIMEOUT=700`
+/// inverts the relationship — exactly as they can in Go, where `minTimeout` is
+/// also 700 against the same 1000ms default. `rslock` handles that by returning
+/// `TtlExceeded` rather than handing back a lock that has already expired.
+const _: () = assert!(DEFAULT_OP_TIMEOUT_MS < DEFAULT_LOCK_TIMEOUT_MS);
+
+/// Per-operation deadline, read from `REDIS_OP_TIMEOUT_MS`.
+///
+/// **Deviation:** Go has no env var here — it derives `DefaultRedisTimeout` from
+/// the `redis.Options.ReadTimeout` its caller passes to `InitRedisOptions`
+/// (`redis.go:188-190`). The Rust port builds its pool from env, so the knob is
+/// exposed as env too. The *default* is identical, which is the part that matters.
+#[must_use]
+pub fn op_timeout() -> Duration {
+    let ms = op_timeout_ms_from(env_i64("REDIS_OP_TIMEOUT_MS"));
+    Duration::from_millis(u64::try_from(ms).unwrap_or(1_000))
+}
+
 /// Read an env var as `i64`, returning `None` when unset/empty/unparseable
 /// (matching Go's `strconv.Atoi(os.Getenv(...))` err-to-default flow).
 fn env_i64(name: &str) -> Option<i64> {
@@ -311,11 +359,16 @@ impl RedisPool {
 
     /// Ping Redis through a pooled connection.
     ///
-    /// mirrors: `checkRedisHealth`'s two-second `PING`.
+    /// Bounded by [`op_timeout`]. mirrors: `checkRedisHealth`'s `PING`.
     pub async fn ping(&self) -> anyhow::Result<()> {
-        let mut conn = self.pool.get().await?;
-        redis::cmd("PING").query_async::<String>(&mut conn).await?;
-        Ok(())
+        let t = op_timeout();
+        tokio::time::timeout(t, async {
+            let mut conn = self.pool.get().await?;
+            redis::cmd("PING").query_async::<String>(&mut conn).await?;
+            Ok::<(), anyhow::Error>(())
+        })
+        .await
+        .map_err(|_| anyhow::anyhow!("[Redis] PING timeout after {t:?}"))?
     }
 
     /// Snapshot connection-pool capacity and utilization.
@@ -332,36 +385,49 @@ impl RedisPool {
 
     /// Store JSON-marshalled `value` under `key` with a soft-clamped TTL.
     ///
-    /// A TTL of zero (or one clamped to zero) writes with no expiry. mirrors:
-    /// `StoreRedisWithContext` — `phjson.Marshal` then `SET` with
-    /// `clampStoreTTL(id, duration)`.
+    /// A TTL of zero (or one clamped to zero) writes with no expiry. Bounded by
+    /// [`op_timeout`]. mirrors: `StoreRedisWithContext` — `phjson.Marshal` then
+    /// `SET` with `clampStoreTTL(id, duration)`.
     pub async fn store<T: Serialize>(
         &self,
         key: &str,
         value: &T,
         ttl: Duration,
     ) -> anyhow::Result<()> {
+        // Serialize before starting the clock: marshalling is CPU-bound local
+        // work, and charging it against a broker deadline would be misleading.
         let json = serde_json::to_string(value)?;
         let ms = clamp_ttl(ttl).as_millis();
-        let mut conn = self.pool.get().await?;
-        if ms == 0 {
-            conn.set::<_, _, ()>(key, json).await?;
-        } else {
-            let ms = u64::try_from(ms).unwrap_or(u64::MAX);
-            conn.pset_ex::<_, _, ()>(key, json, ms).await?;
-        }
-        Ok(())
+        let t = op_timeout();
+        tokio::time::timeout(t, async {
+            let mut conn = self.pool.get().await?;
+            if ms == 0 {
+                conn.set::<_, _, ()>(key, json).await?;
+            } else {
+                let ms = u64::try_from(ms).unwrap_or(u64::MAX);
+                conn.pset_ex::<_, _, ()>(key, json, ms).await?;
+            }
+            Ok::<(), anyhow::Error>(())
+        })
+        .await
+        .map_err(|_| anyhow::anyhow!("[Redis] SET timeout after {t:?}"))?
     }
 
     /// Fetch the raw string stored under `key`.
     ///
     /// A key miss (redis-nil) is quiet: returns `Ok(None)`, never an error.
-    /// mirrors: `GetRedisWithContext` / `GetRedis` returning `("", nil)`.
+    /// Bounded by [`op_timeout`]. mirrors: `GetRedisWithContext` / `GetRedis`
+    /// returning `("", nil)`.
     pub async fn get(&self, key: &str) -> anyhow::Result<Option<String>> {
-        let mut conn = self.pool.get().await?;
-        // `Option<String>` decodes redis-nil to `None` instead of erroring.
-        let val: Option<String> = conn.get(key).await?;
-        Ok(val)
+        let t = op_timeout();
+        tokio::time::timeout(t, async {
+            let mut conn = self.pool.get().await?;
+            // `Option<String>` decodes redis-nil to `None` instead of erroring.
+            let val: Option<String> = conn.get(key).await?;
+            Ok::<Option<String>, anyhow::Error>(val)
+        })
+        .await
+        .map_err(|_| anyhow::anyhow!("[Redis] GET timeout after {t:?}"))?
     }
 
     /// Read the remaining time-to-live of `key` (Redis `PTTL`).
@@ -374,33 +440,53 @@ impl RedisPool {
     /// otherwise learn how long a shared entry has left: recomputing it from the
     /// value's own expiry field (an `expiresIn`, say) restarts the clock and
     /// silently extends the effective lifetime beyond what the writer intended.
+    ///
+    /// Bounded by [`op_timeout`].
     pub async fn ttl(&self, key: &str) -> anyhow::Result<KeyTtl> {
-        let mut conn = self.pool.get().await?;
-        let ms: i64 = conn.pttl(key).await?;
-        Ok(KeyTtl::from_pttl(ms))
+        let t = op_timeout();
+        tokio::time::timeout(t, async {
+            let mut conn = self.pool.get().await?;
+            let ms: i64 = conn.pttl(key).await?;
+            Ok::<KeyTtl, anyhow::Error>(KeyTtl::from_pttl(ms))
+        })
+        .await
+        .map_err(|_| anyhow::anyhow!("[Redis] PTTL timeout after {t:?}"))?
     }
 
     /// Delete `key`. Deleting a missing key is not an error.
     ///
-    /// mirrors: `DeleteRedisWithContext` / `DeleteRedis`.
+    /// Bounded by [`op_timeout`]. mirrors: `DeleteRedisWithContext` / `DeleteRedis`.
     pub async fn delete(&self, key: &str) -> anyhow::Result<()> {
-        let mut conn = self.pool.get().await?;
-        conn.del::<_, ()>(key).await?;
-        Ok(())
+        let t = op_timeout();
+        tokio::time::timeout(t, async {
+            let mut conn = self.pool.get().await?;
+            conn.del::<_, ()>(key).await?;
+            Ok::<(), anyhow::Error>(())
+        })
+        .await
+        .map_err(|_| anyhow::anyhow!("[Redis] DEL timeout after {t:?}"))?
     }
 
     /// Acquire the distributed lock `key` for `ttl`, or `None` on contention /
     /// failure (a user should retry after a short wait).
     ///
-    /// Uses the manager's default retry (Redlock, drift factor `0.01`).
-    /// mirrors: `AcquireLock` — `(false, nil)` contention becomes `None`.
+    /// Uses the manager's default retry (Redlock, drift factor `0.01`) and is
+    /// bounded by [`op_timeout`]. mirrors: `AcquireLock` — `(false, nil)`
+    /// contention becomes `None`.
     pub async fn acquire_lock(&self, key: &str, ttl: Duration) -> Option<Lock> {
-        self.locks.lock(key.as_bytes(), ttl).await.ok()
+        lock_bounded(&self.locks, key, ttl).await
     }
 
     /// Acquire the lock with an explicit retry count and delay.
     ///
     /// mirrors: `AcquireLockWithRetry` — `redsync.WithTries` / `WithRetryDelay`.
+    ///
+    /// ⚠️ **`tries × delay` above [`op_timeout`] is truncated by the deadline**,
+    /// because the timeout wraps the whole retry loop rather than each attempt.
+    /// That is deliberate parity: Go wraps `mutex.LockContext` — retries included
+    /// — in one `DefaultRedisTimeout` context (`redis.go:604-607`), so a caller
+    /// asking for 50 tries at 100ms gets ~1s of trying there too. Poll for longer
+    /// than the deadline in the *caller*, not through this argument.
     pub async fn acquire_lock_with_retry(
         &self,
         key: &str,
@@ -410,14 +496,65 @@ impl RedisPool {
     ) -> Option<Lock> {
         let mut mgr = self.locks.clone();
         mgr.set_retry(tries, delay);
-        mgr.lock(key.as_bytes(), ttl).await.ok()
+        lock_bounded(&mgr, key, ttl).await
     }
 
     /// Release a previously acquired lock (best-effort, as in Redlock).
     ///
-    /// mirrors: `ReleaseLock` — `mutex.UnlockContext`.
+    /// Bounded by [`op_timeout`]. mirrors: `ReleaseLock` — `mutex.UnlockContext`.
+    ///
+    /// **Returns `()` on purpose.** `rslock::unlock` reports nothing, but it runs
+    /// the same atomic compare-and-delete Lua script as Go's redsync — `GET` the
+    /// key, `DEL` only when the value is still this holder's token — so it can
+    /// never free somebody else's lock. Go's extra `(bool, error)` only lets it
+    /// *log* "not owner"; its own caller logs and continues
+    /// (`redis.go:426-430`). The safety property is identical, and it rests on
+    /// the lock TTL outliving the critical section, not on unlock confirming.
     pub async fn release(&self, lock: &Lock) {
-        self.locks.unlock(lock).await;
+        let t = op_timeout();
+        if tokio::time::timeout(t, self.locks.unlock(lock))
+            .await
+            .is_err()
+        {
+            // Not fatal: the lock's TTL still expires it. Worth a line, though —
+            // silent unlock failure looks exactly like healthy operation while
+            // every critical section is quietly serialized on the TTL instead.
+            tracing::warn!(
+                timeout = ?t,
+                "[Redis] lock release timed out; falling back to TTL expiry"
+            );
+        }
+    }
+}
+
+/// Acquire a Redlock through `mgr`, bounded by [`op_timeout`], classifying the
+/// outcome the way Go does.
+///
+/// Go splits the failure space in two (`redis.go:511-528`): `ErrFailed` /
+/// `ErrTaken` are ordinary contention and get a `LogD`, everything else is an
+/// infrastructure fault wrapped in a `LockError`. The same split here.
+///
+/// Contention is logged rather than dropped because `rslock` cannot distinguish
+/// the two cases for us: `lock_instance` swallows the per-server Redis error and
+/// returns a bare `bool`, so a broker that is *down* also ends up as
+/// `Unavailable` once the retries drain. Without a line here, a total Redis
+/// outage would be indistinguishable from a busy key.
+async fn lock_bounded(mgr: &rslock::LockManager, key: &str, ttl: Duration) -> Option<Lock> {
+    let t = op_timeout();
+    match tokio::time::timeout(t, mgr.lock(key.as_bytes(), ttl)).await {
+        Ok(Ok(lock)) => Some(lock),
+        Ok(Err(rslock::LockError::Unavailable)) => {
+            tracing::debug!(key, "[Redis] lock already held");
+            None
+        }
+        Ok(Err(error)) => {
+            tracing::warn!(key, %error, "[Redis] lock acquisition failed");
+            None
+        }
+        Err(_) => {
+            tracing::warn!(key, timeout = ?t, "[Redis] lock acquisition timed out");
+            None
+        }
     }
 }
 
@@ -437,6 +574,55 @@ mod tests {
     #[test]
     fn csrf_key_format() {
         assert_eq!(csrf_key("abc123"), "csrf-abc123");
+    }
+
+    /// The regression this guards, and the whole reason the deadline exists: a
+    /// broker that completes the TCP handshake and then goes silent used to hang
+    /// the caller **forever**. Inside a gRPC handler that is a wedged request,
+    /// not a slow one, and no amount of caller-side retry recovers it.
+    ///
+    /// Needs no Redis. A tarpit listener — accept the connection, never write a
+    /// byte — reproduces the stall exactly, and is strictly nastier than a dead
+    /// broker: a refused connection always failed fast, which is why this went
+    /// unnoticed. Uses the default 1s deadline rather than setting an env var,
+    /// because `std::env::set_var` races every other test in the binary.
+    #[tokio::test]
+    async fn stalled_broker_times_out_instead_of_hanging() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let mut accepted = Vec::new();
+            while let Ok((sock, _)) = listener.accept().await {
+                // Hold the socket open and never reply. Dropping it would send a
+                // FIN and turn this into the fast-failure case we are not testing.
+                accepted.push(sock);
+            }
+        });
+
+        let pool = RedisPool::connect(redis::ConnectionInfo {
+            addr: redis::ConnectionAddr::Tcp("127.0.0.1".to_string(), addr.port()),
+            redis: redis::RedisConnectionInfo::default(),
+        })
+        .expect("pool construction is lazy and must not contact the broker");
+
+        let started = std::time::Instant::now();
+        let result = pool.get("pc-redis:test:tarpit").await;
+        let elapsed = started.elapsed();
+
+        assert!(result.is_err(), "a stalled broker must surface as an error");
+        // Upper bound: the call ended at all.
+        assert!(
+            elapsed < Duration::from_secs(5),
+            "GET against a stalled broker took {elapsed:?}; the deadline did not fire"
+        );
+        // Lower bound: it ended *because of the deadline*, not because the
+        // connection was refused or reset. Without this the test would still
+        // pass if the tarpit stopped tarpitting, quietly testing nothing.
+        assert!(
+            elapsed >= Duration::from_millis(900),
+            "GET returned after only {elapsed:?} — that is a fast failure, not the \
+             deadline, so this test is no longer exercising a stalled broker"
+        );
     }
 
     #[test]
@@ -495,6 +681,25 @@ mod tests {
         assert_eq!(trx_lock_timeout_ms_from(Some(699)), 2000);
         assert_eq!(trx_lock_timeout_ms_from(Some(700)), 700); // at min
         assert_eq!(trx_lock_timeout_ms_from(Some(5000)), 5000);
+    }
+
+    /// The regression this guards: every command used to be unbounded, so a
+    /// broker that accepted the connection and then stalled hung the caller
+    /// forever — inside a gRPC handler, that is a wedged request, not a slow one.
+    #[test]
+    fn op_timeout_defaults_to_go_s_one_second() {
+        assert_eq!(op_timeout_ms_from(None), 1_000);
+        assert_eq!(op_timeout_ms_from(Some(500)), 500);
+        assert_eq!(op_timeout_ms_from(Some(5_000)), 5_000);
+    }
+
+    /// A zero or negative deadline would abort every command instantly, which is
+    /// a worse failure than the unbounded wait — fall back to the default.
+    #[test]
+    fn op_timeout_rejects_non_positive() {
+        assert_eq!(op_timeout_ms_from(Some(0)), 1_000);
+        assert_eq!(op_timeout_ms_from(Some(-1)), 1_000);
+        assert_eq!(op_timeout_ms_from(Some(i64::MIN)), 1_000);
     }
 
     #[test]
