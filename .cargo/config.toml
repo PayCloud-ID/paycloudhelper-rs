@@ -2,3 +2,7 @@
 # The workspace promises Rust 1.88. Prefer the newest transitive versions that
 # still honor that MSRV instead of silently locking newer-toolchain releases.
 incompatible-rust-versions = "fallback"
+
+[alias]
+# `cargo xtask <task>` — workspace dev tasks (see xtask/src/main.rs).
+xtask = "run --package xtask --"

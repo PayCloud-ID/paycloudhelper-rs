@@ -21,6 +21,19 @@ jobs:
           components: rustfmt
       - run: cargo fmt --all --check
 
+  # Blocking from day one, which is only safe because it is a ratchet: the ~115
+  # already-unannotated exports are recorded in xtask/mirrors-baseline.txt and
+  # tolerated. It fails on a NEW unannotated export, or on a baseline entry that
+  # no longer matches anything. An advisory version of this would be ignored,
+  # and the omissions it exists to catch have reached a release four times.
+  lint-mirrors:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo xtask lint-mirrors
+
   clippy:
     runs-on: ubuntu-latest
     steps:
