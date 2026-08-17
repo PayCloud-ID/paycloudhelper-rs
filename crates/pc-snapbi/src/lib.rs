@@ -8,7 +8,9 @@
 //! graded byte-for-byte against Go.
 //!
 //! Go symbols mirrored:
-//! - [`symmetric_sign`] ⇔ `helpers.SymmetricSignatureGen`
+//! - [`symmetric_sign`] ⇔ `services.SignatureService` **and**
+//!   `helpers.SymmetricSignatureGen` — two Go functions that disagree on
+//!   whether the body is minified before hashing; see [`symmetric_sign`]
 //! - [`symmetric_verify`] ⇔ `helpers.ValidateSignatureSnap`
 //! - [`rsa_sign`] ⇔ `helpers.SignatureGenerate` / `services.SignatureGenerate`
 //! - [`rsa_verify`] ⇔ `helpers.ValidateSignature` (`rsaPublicKey.unsign`)
@@ -45,9 +47,6 @@ type HmacSha512 = Hmac<Sha512>;
 
 /// Assemble the SNAP-BI symmetric string-to-sign.
 ///
-/// Mirrors the layout from Go `helpers.SymmetricSignatureGen` /
-/// `helpers.ValidateSignatureSnap`:
-///
 /// ```text
 /// METHOD:url:accessToken:lower(hex(sha256(json_minify(body)))):timestamp
 /// ```
@@ -56,7 +55,33 @@ type HmacSha512 = Hmac<Sha512>;
 /// **minified** JSON body. Minification is delegated to
 /// [`pc_core::json_minify`] (the byte-exact Go `json.Compact` twin); on a
 /// minify error the body hashes to the empty input, mirroring Go's
-/// `bb, _ := JsonMinify(...)` which discards the error.
+/// `bb, _ := JsonMinify(...)`, which discards the error and returns `[]byte{}`
+/// (`helpers/string.go:77-92`) — not a partial buffer.
+///
+/// ## ⚠️ Go minifies here in two places out of three
+///
+/// Go has no single string-to-sign function; it has three copies, and they do
+/// **not** agree on the body hash:
+///
+/// | Go function | hashes | Rust path |
+/// |---|---|---|
+/// | `helpers.ValidateSignatureSnap` (`signature.go:26`) | **minified** | [`symmetric_verify`] |
+/// | `services.SignatureService` (`v1.0-utilities-impl.go:52`) | **minified** | [`symmetric_sign`] via the signature-service endpoint |
+/// | `helpers.SymmetricSignatureGen` (`signature.go:188`) | **raw** | [`symmetric_sign`] via the outbound vendor calls |
+///
+/// So minifying unconditionally is correct for two of the three, and the third
+/// agrees anyway **as long as its body is already compact** — which it is: every
+/// outbound caller builds the body with `serde_json::to_vec`, whose output has
+/// no insignificant whitespace, and minifying compact JSON is the identity.
+/// `minify_is_identity_on_compact_json` pins that property, because it is the
+/// only reason one function can serve all three.
+///
+/// The divergence is therefore latent, not live: it would surface only if some
+/// future caller signed a **pretty-printed** body through the outbound path,
+/// where Go would hash the raw bytes and this would hash the compacted ones.
+/// `raw_and_minified_diverge_on_pretty_json` documents that case in executable
+/// form. Do not "fix" this by dropping the minify — that silently breaks the two
+/// paths that need it, including inbound signature verification.
 fn symmetric_string_to_sign(method: &str, url: &str, token: &str, body: &[u8], ts: &str) -> String {
     let minified = pc_core::json_minify(body).unwrap_or_default();
     let digest = Sha256::digest(&minified);
@@ -66,8 +91,13 @@ fn symmetric_string_to_sign(method: &str, url: &str, token: &str, body: &[u8], t
 
 /// Generate the SNAP-BI symmetric signature (HMAC-SHA512, base64 std).
 ///
-/// Go: `helpers.SymmetricSignatureGen`. `secret` is the API secret key,
-/// output is `base64.StdEncoding` of `HMAC_SHA512(secret, stringToSign)`.
+/// `secret` is the API secret key; output is `base64.StdEncoding` of
+/// `HMAC_SHA512(secret, stringToSign)`.
+///
+/// Go: **two** counterparts, `services.SignatureService` (minified body) and
+/// `helpers.SymmetricSignatureGen` (raw body). See
+/// [`symmetric_string_to_sign`] for why one function covers both and what would
+/// break that.
 pub fn symmetric_sign(
     secret: &[u8],
     method: &str,
@@ -254,8 +284,12 @@ pub fn decrypt_aes(key: &[u8], input: &str) -> Result<String> {
 ///
 /// Go: the `jwt.MapClaims` consumed in `paycloudhelper.RevokeToken` /
 /// `middlewares.GetTokenClaims`. `Expired` is a **string** formatted
-/// `2006-01-02 15:04:05` (Go layout) / `%Y-%m-%d %H:%M:%S` (Rust), *not* a
-/// numeric `exp`. Any other claims land in `extra`.
+/// `2006-01-02 15:04:05` (Go layout) / `%Y-%m-%d %H:%M:%S` (Rust), and it is how
+/// PayCloud-issued tokens carry their expiry.
+///
+/// A numeric `exp` may still be present — third-party tokens routinely have one,
+/// and [`verify_jwt_rs256`] validates it when it is. It simply is not captured
+/// as a field here; like every other claim, it lands in `extra`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Claims {
     /// The `Expired` string claim (Go layout `2006-01-02 15:04:05`).
@@ -271,17 +305,31 @@ pub struct Claims {
 /// Go: `middlewares.GetTokenClaims` / `paycloudhelper.RevokeToken`. Only the
 /// `RS256` algorithm is accepted (any other alg is rejected, mirroring the
 /// `token.Method.(*jwt.SigningMethodRSA)` guard). The public key is a PKIX PEM
-/// (`APP_PUBLIC_KEY` / vendor public key). Signature and alg are verified here;
-/// the time-based `Expired`/revoke logic is left to the caller (as Go does it
-/// outside the parse callback).
+/// (`APP_PUBLIC_KEY` / vendor public key).
+///
+/// Verified here: signature, algorithm, and the numeric `exp` **when the token
+/// has one**. A token with no `exp` is still accepted — PayCloud's own tokens
+/// carry the custom [`Claims::expired`] string instead, and interpreting that
+/// (along with revocation) remains the caller's job, exactly as Go does it
+/// outside the parse callback.
 pub fn verify_jwt_rs256(pub_pem: &str, token: &str) -> Result<Claims> {
     let key = DecodingKey::from_rsa_pem(pub_pem.as_bytes())
         .context("failed to build RS256 decoding key from PEM")?;
 
     let mut validation = Validation::new(Algorithm::RS256);
-    // Custom string `Expired` claim, no numeric `exp` — disable the built-in
-    // exp requirement and validation so jsonwebtoken does not reject tokens.
-    validation.validate_exp = false;
+    // Validate `exp` when the token carries one, but never *require* one.
+    //
+    // These are two separate switches in `jsonwebtoken`, and conflating them is
+    // what led this to be turned off wholesale. `validate_exp` only fires on a
+    // parsed claim — `matches!(claims.exp, TryParse::Parsed(exp) if ...)`,
+    // validation.rs:270-277 — so PayCloud tokens carrying just the custom
+    // `Expired` string sail through untouched. Requiring `exp` is the separate
+    // `required_spec_claims` (defaults to `{"exp"}`), which is what would have
+    // rejected them, so that stays empty.
+    //
+    // The result is the safe superset: a vendor token with a real numeric `exp`
+    // is now rejected once expired instead of being accepted indefinitely.
+    validation.validate_exp = true;
     validation.validate_aud = false;
     validation.required_spec_claims = std::collections::HashSet::new();
 
@@ -479,5 +527,135 @@ mod tests {
         )
         .unwrap();
         assert!(verify_jwt_rs256(&pub_pem, &hs_token).is_err());
+    }
+
+    /// A token with a numeric `exp` in the past must be rejected. It used to be
+    /// accepted: `validate_exp` was switched off wholesale, on the mistaken
+    /// premise that PayCloud tokens carry no `exp` so the check was useless.
+    /// It is useless *for those* tokens, and it is the only expiry check a
+    /// third-party token has.
+    #[test]
+    fn jwt_rejects_a_token_whose_numeric_exp_has_passed() {
+        #[derive(Serialize)]
+        struct Mint {
+            exp: u64,
+        }
+
+        let (priv_key, pub_key) = test_keypair();
+        let priv_pkcs1 = priv_key.to_pkcs1_pem(LineEnding::LF).unwrap().to_string();
+        let pub_pem = pub_key.to_public_key_pem(LineEnding::LF).unwrap();
+        let enc_key = EncodingKey::from_rsa_pem(priv_pkcs1.as_bytes()).unwrap();
+
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+
+        // Well past the crate's default 60s leeway.
+        let expired = encode(
+            &Header::new(Algorithm::RS256),
+            &Mint { exp: now - 3_600 },
+            &enc_key,
+        )
+        .unwrap();
+        assert!(
+            verify_jwt_rs256(&pub_pem, &expired).is_err(),
+            "an expired numeric exp must be rejected"
+        );
+
+        let live = encode(
+            &Header::new(Algorithm::RS256),
+            &Mint { exp: now + 3_600 },
+            &enc_key,
+        )
+        .unwrap();
+        assert!(
+            verify_jwt_rs256(&pub_pem, &live).is_ok(),
+            "a token still within its exp must be accepted"
+        );
+    }
+
+    /// Turning `validate_exp` on must NOT start requiring `exp` — those are
+    /// separate switches, and every PayCloud-issued token omits it. Requiring it
+    /// would reject the entire fleet, so this is the guard that keeps
+    /// `required_spec_claims` empty.
+    #[test]
+    fn jwt_still_accepts_a_token_with_no_exp_at_all() {
+        #[derive(Serialize)]
+        struct Mint {
+            #[serde(rename = "Expired")]
+            expired: String,
+        }
+
+        let (priv_key, pub_key) = test_keypair();
+        let priv_pkcs1 = priv_key.to_pkcs1_pem(LineEnding::LF).unwrap().to_string();
+        let pub_pem = pub_key.to_public_key_pem(LineEnding::LF).unwrap();
+        let enc_key = EncodingKey::from_rsa_pem(priv_pkcs1.as_bytes()).unwrap();
+
+        let token = encode(
+            &Header::new(Algorithm::RS256),
+            &Mint {
+                expired: "2099-12-31 23:59:59".to_string(),
+            },
+            &enc_key,
+        )
+        .unwrap();
+
+        let claims = verify_jwt_rs256(&pub_pem, &token).expect("no exp must still verify");
+        assert_eq!(claims.expired, "2099-12-31 23:59:59");
+    }
+
+    /// The invariant that lets one `symmetric_string_to_sign` serve all three Go
+    /// functions: minifying already-compact JSON changes nothing, so the one Go
+    /// path that hashes raw bytes (`SymmetricSignatureGen`) agrees with this
+    /// crate for every body a caller builds via `serde_json::to_vec`.
+    ///
+    /// If this ever fails, [`symmetric_sign`] has started diverging from Go on
+    /// the live outbound vendor calls.
+    #[test]
+    fn minify_is_identity_on_compact_json() {
+        for compact in [
+            b"{}".as_slice(),
+            br#"{"a":1,"b":"two"}"#.as_slice(),
+            br#"{"amount":{"value":"100.00","currency":"IDR"},"items":[1,2,3]}"#.as_slice(),
+            br#"{"nested":{"deep":{"empty":{},"arr":[]}}}"#.as_slice(),
+            // A string containing whitespace must survive: minify strips only
+            // *insignificant* whitespace, never anything inside a literal.
+            br#"{"note":"hello  world\n"}"#.as_slice(),
+        ] {
+            let minified = pc_core::json_minify(compact).expect("valid JSON");
+            assert_eq!(
+                minified.as_slice(),
+                compact,
+                "minify altered already-compact JSON: {}",
+                String::from_utf8_lossy(compact)
+            );
+        }
+    }
+
+    /// The latent divergence, in executable form: for a *pretty-printed* body,
+    /// hashing raw bytes and hashing minified bytes give different signatures.
+    ///
+    /// Nothing hits this today — every outbound caller builds compact bodies —
+    /// but it is the precise condition under which [`symmetric_sign`] would stop
+    /// matching Go's `SymmetricSignatureGen`, so it is worth being able to point
+    /// at rather than re-deriving.
+    #[test]
+    fn raw_and_minified_diverge_on_pretty_json() {
+        let pretty = b"{\n  \"a\": 1\n}";
+        let minified = pc_core::json_minify(pretty).expect("valid JSON");
+        assert_ne!(minified.as_slice(), pretty.as_slice());
+
+        let over_minified = hex::encode(Sha256::digest(&minified));
+        let over_raw = hex::encode(Sha256::digest(pretty));
+        assert_ne!(
+            over_minified, over_raw,
+            "if these ever match, the whole raw-vs-minified question is moot"
+        );
+
+        // And the signature this crate produces is the minified one.
+        assert!(
+            symmetric_string_to_sign("POST", "/u", "tok", pretty, "ts").contains(&over_minified)
+        );
     }
 }

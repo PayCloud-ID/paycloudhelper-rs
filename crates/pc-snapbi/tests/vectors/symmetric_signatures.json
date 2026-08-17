@@ -1,5 +1,5 @@
 {
-  "oracle": "Go crypto/hmac SHA-512 over the qoinhub SNAP-BI string-to-sign",
+  "oracle": "Rust self-consistency vectors, HMAC-SHA-512 over the qoinhub SNAP-BI string-to-sign with a MINIFIED body hash. Layout matches Go services.SignatureService (v1.0-utilities-impl.go:52) and helpers.ValidateSignatureSnap (signature.go:26). NOT captured from a Go oracle: the minified-body signature can only be produced by hashing the compacted body, so it cannot have come from helpers.SymmetricSignatureGen, which hashes raw bytes. Genuinely Go-sourced vectors live in go_algorithm_vectors.rs; capturing Go-sourced ones for THIS layout is still outstanding.",
   "captured_at": "2026-07-30",
   "vectors": [
     {
