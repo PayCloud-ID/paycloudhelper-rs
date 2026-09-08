@@ -27,7 +27,6 @@ use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use axum::{Json, Router};
-use rand::RngCore;
 use tower_http::limit::RequestBodyLimitLayer;
 use tower_http::request_id::{
     MakeRequestId, PropagateRequestIdLayer, RequestId, SetRequestIdLayer,
@@ -160,8 +159,7 @@ pub fn get_or_generate_request_id(header: Option<&str>) -> String {
 ///
 /// mirrors: private `generateRequestID` — `hex.EncodeToString(rand 16 bytes)`.
 fn generate_request_id() -> String {
-    let mut bytes = [0u8; 16];
-    rand::thread_rng().fill_bytes(&mut bytes);
+    let bytes = rand::random::<[u8; 16]>();
     hex::encode(bytes)
 }
 

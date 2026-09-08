@@ -25,7 +25,7 @@
 use std::fmt::Display;
 use std::time::Duration;
 
-use redis::AsyncCommands;
+use redis::{AsyncCommands, IntoConnectionInfo};
 use serde::Serialize;
 
 /// Re-export of the acquired distributed lock handle.
@@ -330,16 +330,16 @@ pub async fn init_from_env() -> anyhow::Result<Option<RedisPool>> {
         _ => 0,
     };
 
-    let conn_info = redis::ConnectionInfo {
-        addr: redis::ConnectionAddr::Tcp(host, port_num),
-        redis: redis::RedisConnectionInfo {
-            db,
-            // Go's InitRedisOptions defaults Username to "default".
-            username: Some("default".to_string()),
-            password: env_nonempty("REDIS_PASSWORD"),
-            ..Default::default()
-        },
-    };
+    let mut redis_settings = redis::RedisConnectionInfo::default()
+        .set_db(db)
+        // Go's InitRedisOptions defaults Username to "default".
+        .set_username("default");
+    if let Some(password) = env_nonempty("REDIS_PASSWORD") {
+        redis_settings = redis_settings.set_password(password);
+    }
+    let conn_info = (host, port_num)
+        .into_connection_info()?
+        .set_redis_settings(redis_settings);
 
     RedisPool::connect(conn_info).map(Some)
 }

@@ -51,6 +51,9 @@ paycloudhelper = { git = "ssh://git@github.com/PayCloud-ID/paycloudhelper-rs", t
 
 ## Development
 
+Rust 1.94.0 or newer is required by SQLx 0.9. Local development and CI use
+the version pinned in `rust-toolchain.toml`.
+
 ```sh
 cargo fmt --all
 cargo clippy --workspace --all-targets --all-features -- -D warnings

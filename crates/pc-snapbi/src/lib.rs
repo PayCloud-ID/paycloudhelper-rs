@@ -33,6 +33,8 @@ use aes_gcm::{Aes256Gcm, KeyInit, Nonce};
 use rsa::pkcs1::DecodeRsaPrivateKey;
 use rsa::pkcs1v15::{Signature, SigningKey, VerifyingKey};
 use rsa::pkcs8::DecodePublicKey;
+// RSA 0.9 uses digest 0.10; its re-export keeps signing on the matching SHA-2 API.
+use rsa::sha2::Sha256 as RsaSha256;
 use rsa::signature::{SignatureEncoding, Signer, Verifier};
 use rsa::{RsaPrivateKey, RsaPublicKey};
 
@@ -112,8 +114,8 @@ pub fn symmetric_sign(
     ts: &str,
 ) -> String {
     let sts = symmetric_string_to_sign(method, url, token, body, ts);
-    let mut mac =
-        <HmacSha512 as Mac>::new_from_slice(secret).expect("HMAC accepts keys of any length");
+    let mut mac = <HmacSha512 as hmac::KeyInit>::new_from_slice(secret)
+        .expect("HMAC accepts keys of any length");
     mac.update(sts.as_bytes());
     let out = mac.finalize().into_bytes();
     B64.encode(out)
@@ -135,8 +137,8 @@ pub fn symmetric_verify(
     sig_b64: &str,
 ) -> bool {
     let sts = symmetric_string_to_sign(method, url, token, body, ts);
-    let mut mac =
-        <HmacSha512 as Mac>::new_from_slice(secret).expect("HMAC accepts keys of any length");
+    let mut mac = <HmacSha512 as hmac::KeyInit>::new_from_slice(secret)
+        .expect("HMAC accepts keys of any length");
     mac.update(sts.as_bytes());
     let expected = mac.finalize().into_bytes();
 
@@ -165,7 +167,7 @@ fn asymmetric_string_to_sign(client_key: &str, ts: &str) -> String {
 /// mirrors: `helpers.SignatureGenerate` + `services.SignatureGenerate`
 pub fn rsa_sign(priv_pem: &str, client_key: &str, ts: &str) -> Result<String> {
     let key = private_key_from_pem(priv_pem)?;
-    let signing_key = SigningKey::<Sha256>::new(key);
+    let signing_key = SigningKey::<RsaSha256>::new(key);
     let msg = asymmetric_string_to_sign(client_key, ts);
     let sig = signing_key.sign(msg.as_bytes());
     Ok(B64.encode(sig.to_bytes()))
@@ -179,7 +181,7 @@ pub fn rsa_sign(priv_pem: &str, client_key: &str, ts: &str) -> Result<String> {
 /// mirrors: `helpers.ValidateSignature`
 pub fn rsa_verify(pub_pem: &str, client_key: &str, ts: &str, sig_b64: &str) -> Result<bool> {
     let key = public_key_from_pem(pub_pem)?;
-    let verifying_key = VerifyingKey::<Sha256>::new(key);
+    let verifying_key = VerifyingKey::<RsaSha256>::new(key);
     let msg = asymmetric_string_to_sign(client_key, ts);
     let raw = B64
         .decode(sig_b64)
@@ -241,11 +243,12 @@ pub fn encrypt_aes(key: &[u8], plaintext: &str) -> Result<String> {
     let cipher = Aes256Gcm::new_from_slice(&derived).map_err(|e| anyhow!("aes init: {e}"))?;
 
     let mut nonce_bytes = [0u8; 12];
-    rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut nonce_bytes);
-    let nonce = Nonce::from_slice(&nonce_bytes);
+    rand::TryRng::try_fill_bytes(&mut rand::rngs::SysRng, &mut nonce_bytes)
+        .context("AES nonce randomness")?;
+    let nonce = Nonce::from(nonce_bytes);
 
     let ciphertext = cipher
-        .encrypt(nonce, plaintext.as_bytes())
+        .encrypt(&nonce, plaintext.as_bytes())
         .map_err(|e| anyhow!("aes-gcm encrypt: {e}"))?;
 
     let mut out = Vec::with_capacity(nonce_bytes.len() + ciphertext.len());
@@ -280,7 +283,7 @@ pub fn decrypt_aes(key: &[u8], input: &str) -> Result<String> {
         return Err(anyhow!("ciphertext too short"));
     }
     let (nonce_bytes, ciphertext) = raw.split_at(12);
-    let nonce = Nonce::from_slice(nonce_bytes);
+    let nonce = nonce_bytes.try_into().expect("nonce is exactly 12 bytes");
 
     let plaintext = cipher
         .decrypt(nonce, ciphertext)
@@ -388,7 +391,7 @@ mod tests {
             symmetric_string_to_sign(method, url, token, body, ts)
         );
 
-        let mut mac = <HmacSha512 as Mac>::new_from_slice(secret).unwrap();
+        let mut mac = <HmacSha512 as hmac::KeyInit>::new_from_slice(secret).unwrap();
         mac.update(expected_sts.as_bytes());
         let expected_sig = B64.encode(mac.finalize().into_bytes());
 

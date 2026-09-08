@@ -211,7 +211,7 @@ impl AmqpClient {
                 .confirm_select(ConfirmSelectOptions::default())
                 .await?;
             channel
-                .queue_declare(&self.queue, declare_options(), FieldTable::default())
+                .queue_declare(self.queue.as_ref().into(), declare_options(), FieldTable::default())
                 .await?;
         }
 
@@ -252,7 +252,13 @@ impl AmqpClient {
         }
         let confirm = state
             .channel
-            .basic_publish("", routing_key, BasicPublishOptions::default(), data, props)
+            .basic_publish(
+                "".into(),
+                routing_key.into(),
+                BasicPublishOptions::default(),
+                data,
+                props,
+            )
             .await?
             .await?;
         if confirm.is_nack() {
@@ -361,8 +367,8 @@ impl AmqpClient {
         let consumer = state
             .channel
             .basic_consume(
-                &self.queue,
-                "",
+                self.queue.as_ref().into(),
+                "".into(),
                 BasicConsumeOptions::default(),
                 FieldTable::default(),
             )
@@ -376,7 +382,7 @@ impl AmqpClient {
         let reply = state
             .channel
             .queue_declare(
-                "",
+                "".into(),
                 QueueDeclareOptions {
                     passive: false,
                     durable: false,
@@ -392,8 +398,8 @@ impl AmqpClient {
         let mut consumer = state
             .channel
             .basic_consume(
-                &reply_queue,
-                "",
+                reply_queue.as_str().into(),
+                "".into(),
                 BasicConsumeOptions::default(),
                 FieldTable::default(),
             )
@@ -429,10 +435,13 @@ impl AmqpClient {
         let state = self.state.write().await.take();
         if let Some(state) = state {
             if state.channel.status().connected() {
-                state.channel.close(200, "client shutdown").await?;
+                state.channel.close(200, "client shutdown".into()).await?;
             }
             if state.connection.status().connected() {
-                state.connection.close(200, "client shutdown").await?;
+                state
+                    .connection
+                    .close(200, "client shutdown".into())
+                    .await?;
             }
         }
         Ok(())

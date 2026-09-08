@@ -102,7 +102,7 @@ pub(crate) fn propagator() -> TextMapCompositePropagator {
 /// mirrors: `phtrace.Shutdown` (a closure in Go; an RAII guard here).
 #[must_use = "dropping the guard immediately flushes and shuts down telemetry"]
 pub struct TraceGuard {
-    tracer: Option<opentelemetry_sdk::trace::TracerProvider>,
+    tracer: Option<opentelemetry_sdk::trace::SdkTracerProvider>,
     meter: Option<opentelemetry_sdk::metrics::SdkMeterProvider>,
 }
 
@@ -154,8 +154,8 @@ impl Drop for TraceGuard {
 /// this is a **no-op**: it returns a disabled guard, leaves the global no-op
 /// providers in place, and [`is_enabled`] stays `false`.
 ///
-/// The enabled path builds tonic-backed OTLP exporters and a Tokio-runtime
-/// batch/periodic pipeline, so it must be called from within a Tokio runtime.
+/// The enabled path builds tonic-backed OTLP exporters with dedicated batch
+/// and periodic worker threads. Exporters must be created within a Tokio runtime.
 ///
 /// mirrors: `phtrace.Init(ctx, phtrace.FromEnv())`.
 ///
@@ -215,8 +215,8 @@ fn build_pipeline(cfg: &Config) -> anyhow::Result<TraceGuard> {
     use opentelemetry::KeyValue;
     use opentelemetry_otlp::WithExportConfig;
     use opentelemetry_sdk::trace::Sampler;
-    use opentelemetry_sdk::{runtime, Resource};
-    use opentelemetry_semantic_conventions::resource as semres;
+    use opentelemetry_sdk::Resource;
+    use opentelemetry_semantic_conventions::attribute as semres;
 
     // ---- resource (service identity + extra attributes) ----
     let mut attrs = vec![
@@ -229,7 +229,7 @@ fn build_pipeline(cfg: &Config) -> anyhow::Result<TraceGuard> {
     for (k, v) in &cfg.resource_attributes {
         attrs.push(KeyValue::new(k.clone(), v.clone()));
     }
-    let resource = Resource::new(attrs);
+    let resource = Resource::builder_empty().with_attributes(attrs).build();
 
     // ---- tracer provider (OTLP tonic + ParentBased(TraceIDRatioBased)) ----
     let mut span_builder = opentelemetry_otlp::SpanExporter::builder()
@@ -244,8 +244,8 @@ fn build_pipeline(cfg: &Config) -> anyhow::Result<TraceGuard> {
         .map_err(|e| anyhow::anyhow!("pc-trace: build span exporter: {e}"))?;
 
     let sampler = Sampler::ParentBased(Box::new(Sampler::TraceIdRatioBased(cfg.sampling_ratio)));
-    let tracer_provider = opentelemetry_sdk::trace::TracerProvider::builder()
-        .with_batch_exporter(span_exporter, runtime::Tokio)
+    let tracer_provider = opentelemetry_sdk::trace::SdkTracerProvider::builder()
+        .with_batch_exporter(span_exporter)
         .with_resource(resource.clone())
         .with_sampler(sampler)
         .build();
@@ -262,10 +262,9 @@ fn build_pipeline(cfg: &Config) -> anyhow::Result<TraceGuard> {
         .build()
         .map_err(|e| anyhow::anyhow!("pc-trace: build metric exporter: {e}"))?;
 
-    let reader =
-        opentelemetry_sdk::metrics::PeriodicReader::builder(metric_exporter, runtime::Tokio)
-            .with_interval(cfg.metric_export_interval)
-            .build();
+    let reader = opentelemetry_sdk::metrics::PeriodicReader::builder(metric_exporter)
+        .with_interval(cfg.metric_export_interval)
+        .build();
     let meter_provider = opentelemetry_sdk::metrics::SdkMeterProvider::builder()
         .with_reader(reader)
         .with_resource(resource)

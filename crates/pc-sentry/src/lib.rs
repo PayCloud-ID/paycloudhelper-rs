@@ -211,16 +211,15 @@ pub fn init(options: &SentryOptions) -> Option<sentry::ClientInitGuard> {
         return None;
     }
 
-    let client_options = sentry::ClientOptions {
-        dsn: options.dsn.parse().ok(),
-        environment: opt_cow(&options.environment),
-        release: opt_cow(&options.release),
-        traces_sample_rate: options.traces_sample_rate,
-        debug: options.debug,
-        attach_stacktrace: false,
-        max_breadcrumbs: BREADCRUMB_DEPTH_RECEIVE_LOG,
-        ..Default::default()
-    };
+    let mut client_options = sentry::ClientOptions::default();
+    client_options.dsn = options.dsn.parse().ok();
+    client_options.environment = opt_cow(&options.environment);
+    client_options.release = opt_cow(&options.release);
+    client_options.traces_sampling_strategy =
+        sentry::TracesSamplingStrategy::FixedRate(options.traces_sample_rate);
+    client_options.debug = options.debug;
+    client_options.attach_stacktrace = false;
+    client_options.max_breadcrumbs = BREADCRUMB_DEPTH_RECEIVE_LOG;
 
     let guard = sentry::init(client_options);
 
