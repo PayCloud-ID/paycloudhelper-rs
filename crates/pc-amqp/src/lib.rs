@@ -193,7 +193,11 @@ impl AmqpClient {
         // difference. It cost a service CrashLoopBackOff in staging before it
         // was found.
         if channel
-            .queue_declare(&self.queue, passive_probe_options(), FieldTable::default())
+            .queue_declare(
+                self.queue.as_ref().into(),
+                passive_probe_options(),
+                FieldTable::default(),
+            )
             .await
             .is_err()
         {
@@ -211,7 +215,11 @@ impl AmqpClient {
                 .confirm_select(ConfirmSelectOptions::default())
                 .await?;
             channel
-                .queue_declare(self.queue.as_ref().into(), declare_options(), FieldTable::default())
+                .queue_declare(
+                    self.queue.as_ref().into(),
+                    declare_options(),
+                    FieldTable::default(),
+                )
                 .await?;
         }
 

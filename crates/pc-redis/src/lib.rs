@@ -599,11 +599,9 @@ mod tests {
             }
         });
 
-        let pool = RedisPool::connect(redis::ConnectionInfo {
-            addr: redis::ConnectionAddr::Tcp("127.0.0.1".to_string(), addr.port()),
-            redis: redis::RedisConnectionInfo::default(),
-        })
-        .expect("pool construction is lazy and must not contact the broker");
+        let conn_info = ("127.0.0.1", addr.port()).into_connection_info().unwrap();
+        let pool = RedisPool::connect(conn_info)
+            .expect("pool construction is lazy and must not contact the broker");
 
         let started = std::time::Instant::now();
         let result = pool.get("pc-redis:test:tarpit").await;
