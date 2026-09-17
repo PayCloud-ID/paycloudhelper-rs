@@ -91,6 +91,13 @@ fn symmetric_string_to_sign(method: &str, url: &str, token: &str, body: &[u8], t
     format!("{method}:{url}:{token}:{blc}:{ts}")
 }
 
+fn symmetric_string_to_sign_v2(method: &str, url: &str, token: &str, body: &[u8], ts: &str) -> String {
+    let minified = pc_core::json_minify(body).unwrap_or_default();
+    let digest = Sha256::digest(&minified);
+    let blc = hex::encode(digest); // hex::encode is already lowercase
+    format!("{method}|{url}|{token}|{blc}|{ts}")
+}
+
 /// Generate the SNAP-BI symmetric signature (HMAC-SHA512, base64 std).
 ///
 /// `secret` is the API secret key; output is `base64.StdEncoding` of
@@ -114,6 +121,22 @@ pub fn symmetric_sign(
     ts: &str,
 ) -> String {
     let sts = symmetric_string_to_sign(method, url, token, body, ts);
+    let mut mac = <HmacSha512 as hmac::KeyInit>::new_from_slice(secret)
+        .expect("HMAC accepts keys of any length");
+    mac.update(sts.as_bytes());
+    let out = mac.finalize().into_bytes();
+    B64.encode(out)
+}
+
+pub fn symmetric_sign_v2(
+    secret: &[u8],
+    method: &str,
+    url: &str,
+    token: &str,
+    body: &[u8],
+    ts: &str,
+) -> String {
+    let sts = symmetric_string_to_sign_v2(method, url, token, body, ts);
     let mut mac = <HmacSha512 as hmac::KeyInit>::new_from_slice(secret)
         .expect("HMAC accepts keys of any length");
     mac.update(sts.as_bytes());
