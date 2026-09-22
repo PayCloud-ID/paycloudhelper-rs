@@ -172,6 +172,28 @@ pub fn symmetric_verify(
     expected.as_slice().ct_eq(provided.as_slice()).into()
 }
 
+pub fn symmetric_verify_v2(
+    secret: &[u8],
+    method: &str,
+    url: &str,
+    token: &str,
+    body: &[u8],
+    ts: &str,
+    sig_b64: &str,
+) -> bool {
+    let sts = symmetric_string_to_sign_v2(method, url, token, body, ts);
+    let mut mac = <HmacSha512 as hmac::KeyInit>::new_from_slice(secret)
+        .expect("HMAC accepts keys of any length");
+    mac.update(sts.as_bytes());
+    let expected = mac.finalize().into_bytes();
+
+    let Ok(provided) = B64.decode(sig_b64) else {
+        return false;
+    };
+    // subtle's ConstantTimeEq for slices returns 0 on a length mismatch.
+    expected.as_slice().ct_eq(provided.as_slice()).into()
+}
+
 // ---------------------------------------------------------------------------
 // Asymmetric signature (RSA PKCS#1 v1.5 with SHA-256)
 // ---------------------------------------------------------------------------
