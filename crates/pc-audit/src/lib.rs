@@ -20,6 +20,28 @@ pub const CMD_PROCESS: &str = "audit-trail-process";
 pub const CMD_DATA: &str = "audit-trail-data";
 /// Transaction lifecycle command.
 pub const CMD_TRX: &str = "audit-trail-trx";
+/// Per-hop transaction trace command. Same publisher pool as [`CMD_TRX`].
+/// mirrors: `paycloudhelper.CmdTransactionTrace`
+pub const CMD_TRACE: &str = "transaction-trace";
+
+/// mirrors: `paycloudhelper.TraceKindHop`
+pub const TRACE_KIND_HOP: &str = "hop";
+/// mirrors: `paycloudhelper.TraceKindMilestone`
+pub const TRACE_KIND_MILESTONE: &str = "milestone";
+/// mirrors: `paycloudhelper.TraceKindPoll`
+pub const TRACE_KIND_POLL: &str = "poll";
+/// mirrors: `paycloudhelper.TraceLegCreateOrder`
+pub const TRACE_LEG_CREATE_ORDER: &str = "create_order";
+/// mirrors: `paycloudhelper.TraceLegCallback`
+pub const TRACE_LEG_CALLBACK: &str = "callback";
+/// mirrors: `paycloudhelper.TraceLegLifecycle`
+pub const TRACE_LEG_LIFECYCLE: &str = "lifecycle";
+/// mirrors: `paycloudhelper.TraceDirectionInbound`
+pub const TRACE_DIR_INBOUND: &str = "inbound";
+/// mirrors: `paycloudhelper.TraceDirectionOutbound`
+pub const TRACE_DIR_OUTBOUND: &str = "outbound";
+/// mirrors: `paycloudhelper.TraceDirectionInternal`
+pub const TRACE_DIR_INTERNAL: &str = "internal";
 
 pub const TRX_STATE_REQUEST_RECEIVED: &str = "request_received";
 pub const TRX_STATE_REQUEST_VALIDATED: &str = "request_validated";
@@ -204,8 +226,94 @@ pub struct AuditTrailTrx {
     pub created_at: String,
 }
 
+/// HTTP side of a hop. Headers are never carried.
+/// mirrors: `paycloudhelper.TraceHTTP`
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TraceHttp {
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub method: String,
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub url: String,
+    #[serde(skip_serializing_if = "is_zero_u16")]
+    pub status: u16,
+}
+
+/// One hop or milestone of a transaction. JSON names are the owner's
+/// search vocabulary and must stay identical to Go `TransactionTrace`.
+/// `createdAt`, `expireAt` and `truncated` are written by the consumer.
+/// mirrors: `paycloudhelper.TransactionTrace`
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TransactionTrace {
+    pub v: u8,
+    pub event: String,
+    pub kind: String,
+    pub leg: String,
+    pub direction: String,
+    pub service: String,
+    pub function: String,
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub peer: String,
+    pub transport: String,
+    pub status: String,
+    #[serde(skip_serializing_if = "is_zero_i64")]
+    pub m_id: i64,
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub merchant_code: String,
+    #[serde(skip_serializing_if = "is_zero_i64")]
+    pub trx_id: i64,
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub trx_no: String,
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub trx_reference_no: String,
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub trx_pay_code1: String,
+    #[serde(skip_serializing_if = "is_zero_i32")]
+    pub trx_pc_id: i32,
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub ticket_id: String,
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub external_id: String,
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub request_id: String,
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub traceparent: String,
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub callback_direction: String,
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub attempt_id: String,
+    #[serde(skip_serializing_if = "is_zero_i32")]
+    pub cycle: i32,
+    #[serde(skip_serializing_if = "is_zero_i32")]
+    pub attempt: i32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub http: Option<TraceHttp>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub request: Option<Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub response: Option<Value>,
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub message: String,
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub error_code: String,
+    #[serde(skip_serializing_if = "is_zero_i64")]
+    pub duration_ms: i64,
+    pub event_time: String,
+}
+
 #[allow(clippy::trivially_copy_pass_by_ref)] // serde skip predicate requires `&T`.
 fn is_zero_i64(value: &i64) -> bool {
+    *value == 0
+}
+
+#[allow(clippy::trivially_copy_pass_by_ref)]
+fn is_zero_i32(value: &i32) -> bool {
+    *value == 0
+}
+
+#[allow(clippy::trivially_copy_pass_by_ref)]
+fn is_zero_u16(value: &u16) -> bool {
     *value == 0
 }
 
@@ -288,6 +396,39 @@ pub fn trx_payload(
         data.event_time = rfc3339_now();
     }
     MessagePayloadAudit::new(CMD_TRX, data).map(Some)
+}
+
+fn has_any_trace_key(t: &TransactionTrace) -> bool {
+    t.trx_id != 0
+        || !t.trx_no.is_empty()
+        || !t.trx_reference_no.is_empty()
+        || !t.trx_pay_code1.is_empty()
+        || !t.ticket_id.is_empty()
+        || !t.merchant_code.is_empty()
+        || t.m_id != 0
+}
+
+/// Construct a trace envelope. No key or no event means skip (`Ok(None)`).
+/// mirrors: `paycloudhelper.LogTransactionTrace`
+pub fn trace_payload(
+    mut t: TransactionTrace,
+) -> Result<Option<MessagePayloadAudit>, serde_json::Error> {
+    if t.event.is_empty() || !has_any_trace_key(&t) {
+        return Ok(None);
+    }
+    if t.v == 0 {
+        t.v = 1;
+    }
+    if t.kind.is_empty() {
+        TRACE_KIND_HOP.clone_into(&mut t.kind);
+    }
+    if t.service.is_empty() {
+        t.service = pc_core_name();
+    }
+    if t.event_time.is_empty() {
+        t.event_time = rfc3339_now();
+    }
+    MessagePayloadAudit::new(CMD_TRACE, t).map(Some)
 }
 
 /// Worker-pool configuration.
@@ -563,6 +704,84 @@ mod tests {
         assert_eq!(CMD_PROCESS, "audit-trail-process");
         assert_eq!(CMD_DATA, "audit-trail-data");
         assert_eq!(CMD_TRX, "audit-trail-trx");
+        assert_eq!(CMD_TRACE, "transaction-trace");
+    }
+
+    /// Byte-exact body shared with paycloudhelper `goldenTransactionTraceJSON`.
+    const GOLDEN_TRANSACTION_TRACE_JSON: &str = r#"{"v":1,"event":"tm.order_created","kind":"milestone","leg":"create_order","direction":"internal","service":"transaction-module","function":"persistOrderTransaction","peer":"mongo","transport":"grpc","status":"success","mId":202610001,"merchantCode":"202610001","trxId":14964329,"trxNo":"T26100014964329","trxReferenceNo":"PRS20261009115424","trxPayCode1":"T26100159355214","trxPcId":3,"ticketId":"tkt-1","externalId":"ext-1","requestId":"req-1","traceparent":"00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01","callbackDirection":"paycloud_to_merchant","attemptId":"T26100014964329:1:2","cycle":1,"attempt":2,"http":{"method":"POST","url":"https://vendor.example/qr","status":200},"request":{"Authorization":"Bearer live-token"},"response":{"status_code":200},"message":"ok","errorCode":"00","durationMs":42,"eventTime":"2026-10-09T11:54:24.123456789+07:00"}"#;
+
+    fn canonical_transaction_trace() -> TransactionTrace {
+        TransactionTrace {
+            v: 1,
+            event: "tm.order_created".into(),
+            kind: TRACE_KIND_MILESTONE.into(),
+            leg: TRACE_LEG_CREATE_ORDER.into(),
+            direction: TRACE_DIR_INTERNAL.into(),
+            service: "transaction-module".into(),
+            function: "persistOrderTransaction".into(),
+            peer: "mongo".into(),
+            transport: "grpc".into(),
+            status: "success".into(),
+            m_id: 202610001,
+            merchant_code: "202610001".into(),
+            trx_id: 14964329,
+            trx_no: "T26100014964329".into(),
+            trx_reference_no: "PRS20261009115424".into(),
+            trx_pay_code1: "T26100159355214".into(),
+            trx_pc_id: 3,
+            ticket_id: "tkt-1".into(),
+            external_id: "ext-1".into(),
+            request_id: "req-1".into(),
+            traceparent: "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01".into(),
+            callback_direction: "paycloud_to_merchant".into(),
+            attempt_id: "T26100014964329:1:2".into(),
+            cycle: 1,
+            attempt: 2,
+            http: Some(TraceHttp {
+                method: "POST".into(),
+                url: "https://vendor.example/qr".into(),
+                status: 200,
+            }),
+            request: Some(serde_json::json!({"Authorization": "Bearer live-token"})),
+            response: Some(serde_json::json!({"status_code": 200})),
+            message: "ok".into(),
+            error_code: "00".into(),
+            duration_ms: 42,
+            event_time: "2026-10-09T11:54:24.123456789+07:00".into(),
+        }
+    }
+
+    #[test]
+    fn trace_payload_uses_owner_field_names_and_skips_keyless() {
+        let t = TransactionTrace {
+            event: "iface.vendor.qr_mpm_generate.response".into(),
+            trx_no: "T26100014964329".into(),
+            trx_pay_code1: "T26100159355214".into(),
+            trx_pc_id: 3,
+            ..Default::default()
+        };
+        let p = trace_payload(t).unwrap().unwrap();
+        assert_eq!(p.command, CMD_TRACE);
+        let s = serde_json::to_string(&p.data).unwrap();
+        for k in [
+            "\"trxNo\"",
+            "\"trxPayCode1\"",
+            "\"trxPcId\":3",
+            "\"event\"",
+            "\"v\":1",
+            "\"kind\":\"hop\"",
+        ] {
+            assert!(s.contains(k), "{k} missing in {s}");
+        }
+        assert!(trace_payload(TransactionTrace::default())
+            .unwrap()
+            .is_none());
+    }
+
+    #[test]
+    fn transaction_trace_json_matches_go_golden() {
+        let s = serde_json::to_string(&canonical_transaction_trace()).unwrap();
+        assert_eq!(s, GOLDEN_TRANSACTION_TRACE_JSON);
     }
 
     #[test]
