@@ -9,8 +9,8 @@ members = ["crates/*", "xtask"]
 # self-identified as 0.1.0, and `cargo tree` could not tell two releases apart.
 # The tags are load-bearing (services pin them; retagging would break them), so
 # the version follows the tags rather than the other way round. This is the
-# next, unreleased version: tag v1.0.3 at release.
-version = "1.0.3"
+# next, unreleased version: tag v1.5.1 at release.
+version = "1.5.1"
 edition = "2021"
 rust-version = "1.94"           # MSRV; required by SQLx 0.9
 license = "LicenseRef-proprietary"
@@ -18,24 +18,24 @@ repository = "https://github.com/PayCloud-ID/paycloudhelper-rs"
 
 [workspace.dependencies]
 # ---- internal crates (path deps; consumers override with git tag) ----
-pc-core = { path = "crates/pc-core", version = "1.0.3" }
-pc-config = { path = "crates/pc-config", version = "1.0.3" }
-pc-log = { path = "crates/pc-log", version = "1.0.3" }
-pc-trace = { path = "crates/pc-trace", version = "1.0.3" }
-pc-sentry = { path = "crates/pc-sentry", version = "1.0.3" }
-pc-json = { path = "crates/pc-json", version = "1.0.3" }
-pc-validate = { path = "crates/pc-validate", version = "1.0.3" }
-pc-resilience = { path = "crates/pc-resilience", version = "1.0.3" }
-pc-redis = { path = "crates/pc-redis", version = "1.0.3" }
-pc-db = { path = "crates/pc-db", version = "1.0.3" }
-pc-amqp = { path = "crates/pc-amqp", version = "1.0.3" }
-pc-audit = { path = "crates/pc-audit", version = "1.0.3" }
-pc-snapbi = { path = "crates/pc-snapbi", version = "1.0.3" }
-pc-http = { path = "crates/pc-http", version = "1.0.3" }
-pc-grpc = { path = "crates/pc-grpc", version = "1.0.3" }
-pc-auth = { path = "crates/pc-auth", version = "1.0.3" }
-pc-health = { path = "crates/pc-health", version = "1.0.3" }
-pc-s3minio = { path = "crates/pc-s3minio", version = "1.0.3" }
+pc-core = { path = "crates/pc-core", version = "1.5.1" }
+pc-config = { path = "crates/pc-config", version = "1.5.1" }
+pc-log = { path = "crates/pc-log", version = "1.5.1" }
+pc-trace = { path = "crates/pc-trace", version = "1.5.1" }
+pc-sentry = { path = "crates/pc-sentry", version = "1.5.1" }
+pc-json = { path = "crates/pc-json", version = "1.5.1" }
+pc-validate = { path = "crates/pc-validate", version = "1.5.1" }
+pc-resilience = { path = "crates/pc-resilience", version = "1.5.1" }
+pc-redis = { path = "crates/pc-redis", version = "1.5.1" }
+pc-db = { path = "crates/pc-db", version = "1.5.1" }
+pc-amqp = { path = "crates/pc-amqp", version = "1.5.1" }
+pc-audit = { path = "crates/pc-audit", version = "1.5.1" }
+pc-snapbi = { path = "crates/pc-snapbi", version = "1.5.1" }
+pc-http = { path = "crates/pc-http", version = "1.5.1" }
+pc-grpc = { path = "crates/pc-grpc", version = "1.5.1" }
+pc-auth = { path = "crates/pc-auth", version = "1.5.1" }
+pc-health = { path = "crates/pc-health", version = "1.5.1" }
+pc-s3minio = { path = "crates/pc-s3minio", version = "1.5.1" }
 
 # ---- third-party (single source of versions; design 03 PC-0) ----
 serde = { version = "1", features = ["derive"] }
