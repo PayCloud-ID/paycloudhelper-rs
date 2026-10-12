@@ -64,6 +64,13 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      # audit-check falls back to `cargo install cargo-audit` under the pinned
+      # 1.94.0 toolchain (rust-toolchain.toml), and the latest cargo-audit pulls
+      # kstring 2.0.5, which needs rustc 1.96 - the install fails before any
+      # advisory is checked. A prebuilt binary sidesteps the toolchain pin.
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-audit
       - uses: rustsec/audit-check@v2
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
