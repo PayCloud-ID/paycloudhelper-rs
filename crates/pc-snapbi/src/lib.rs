@@ -134,6 +134,14 @@ pub fn symmetric_sign(
     B64.encode(out)
 }
 
+/// Generate the v2 SNAP-BI symmetric signature (HMAC-SHA512, base64 std).
+///
+/// Same MAC as [`symmetric_sign`], but the string to sign is joined with `|`
+/// (`method|url|token|hex(sha256(minified body))|ts`) instead of `:`.
+/// no-go-equivalent: no Go counterpart was found in `paycloudhelper` (nor in the
+/// SNAP services' signature code) when this was annotated; the pipe-delimited
+/// format was added here directly. Revisit once the owner names the Go source,
+/// and replace this with a `mirrors:` marker.
 pub fn symmetric_sign_v2(
     secret: &[u8],
     method: &str,
@@ -178,6 +186,12 @@ pub fn symmetric_verify(
     expected.as_slice().ct_eq(provided.as_slice()).into()
 }
 
+/// Verify a v2 SNAP-BI symmetric signature in constant time.
+///
+/// The verifying counterpart of [`symmetric_sign_v2`]: recomputes the `|`-joined
+/// string to sign and compares the decoded MAC with [`subtle`].
+/// no-go-equivalent: see [`symmetric_sign_v2`] - no Go counterpart was found; revisit
+/// once the owner names the Go source.
 pub fn symmetric_verify_v2(
     secret: &[u8],
     method: &str,
