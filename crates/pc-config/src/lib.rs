@@ -159,7 +159,7 @@ pub fn initialize_app() -> Result<(), Vec<ConfigError>> {
 }
 
 fn env_nonempty(key: &str) -> bool {
-    std::env::var(key).map(|v| !v.is_empty()).unwrap_or(false)
+    std::env::var(key).is_ok_and(|v| !v.is_empty())
 }
 
 /// Accepted spellings for each RabbitMQ audit-trail setting, one row per
