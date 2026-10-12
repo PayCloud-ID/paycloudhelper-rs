@@ -91,7 +91,13 @@ fn symmetric_string_to_sign(method: &str, url: &str, token: &str, body: &[u8], t
     format!("{method}:{url}:{token}:{blc}:{ts}")
 }
 
-fn symmetric_string_to_sign_v2(method: &str, url: &str, token: &str, body: &[u8], ts: &str) -> String {
+fn symmetric_string_to_sign_v2(
+    method: &str,
+    url: &str,
+    token: &str,
+    body: &[u8],
+    ts: &str,
+) -> String {
     let minified = pc_core::json_minify(body).unwrap_or_default();
     let digest = Sha256::digest(&minified);
     let blc = hex::encode(digest); // hex::encode is already lowercase
