@@ -67,6 +67,19 @@ recorded here with the reason.
   **Not fixed here:** aligning it changes behaviour for a consumer already
   pinned to `v1.0.2`, so the call is the helper owner's.
 
+## [1.5.1] - 2026-10-12
+
+### Fixed
+- `pc-resilience::Singleflight` no longer serves a stored result after its owner
+  is cancelled (PA-356). A flight whose owning future was dropped, for example by
+  a request budget timeout, was left in the map holding whatever the shared work
+  had produced, and every later call for that key was served it until the process
+  restarted. That was a failed result, or a stale token in qoinhub's case. A
+  flight is now removed by whichever caller finishes it, and by the last waiter
+  to leave on cancellation or panic, so a later call re-runs the work. The
+  trigger was qoinhub's token fetch exceeding its budget timeout (staging
+  incident 2026-10-11). No public API changed.
+
 ## [1.0.2] - 2026-08-04
 
 Tag [`v1.0.2`] · commit `5f2e0d7` — "feat: rework on log compatible with golang
