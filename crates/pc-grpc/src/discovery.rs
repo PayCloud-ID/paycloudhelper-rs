@@ -7,8 +7,11 @@
 //! balanced endpoints are kept **per address**, and a background task re-resolves
 //! on an interval, inserting new addresses and removing gone ones.
 //!
-//! The address diff ([`diff_addrs`]) is pure; the refresher ([`run_refresher`])
-//! is generic over a [`Resolver`] so its tests need no DNS.
+//! Crate-private: the public entry points are
+//! [`GrpcClientFactory::connect_discovered`](crate::GrpcClientFactory::connect_discovered)
+//! and its lazy sibling. The address diff ([`diff_addrs`]) is pure; the
+//! refresher ([`Refresher`]) is generic over a [`Resolver`] so its tests need
+//! no DNS.
 
 use std::collections::BTreeSet;
 use std::future::Future;
@@ -19,13 +22,14 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::Result;
+use tokio::sync::mpsc::error::TrySendError;
 use tokio::sync::mpsc::Sender;
 use tonic::transport::channel::Change;
 use tonic::transport::Endpoint;
 
 /// Key of one balanced endpoint.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum EndpointKey {
+pub(crate) enum EndpointKey {
     /// Slot `n` of the plain host-name endpoint a lazy channel starts with, so
     /// a call never waits on an empty balancer. Removed once real addresses
     /// have been inserted.
@@ -33,6 +37,8 @@ pub enum EndpointKey {
     /// Slot `n` (of `pool`) of one resolved pod address.
     Addr(SocketAddr, usize),
 }
+
+type Changes = Vec<Change<EndpointKey, Endpoint>>;
 
 /// First retry delay while no lookup has succeeded yet; doubles up to `refresh`.
 const FIRST_RETRY: Duration = Duration::from_secs(1);
@@ -42,18 +48,18 @@ const FIRST_RETRY: Duration = Duration::from_secs(1);
 const LOOKUP_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Boxed future returned by [`Resolver::lookup`].
-pub type LookupFuture<'a> =
+pub(crate) type LookupFuture<'a> =
     Pin<Box<dyn Future<Output = io::Result<BTreeSet<SocketAddr>>> + Send + 'a>>;
 
 /// Resolves a `host:port` target to the set of addresses behind it.
-pub trait Resolver: Send + Sync + 'static {
+pub(crate) trait Resolver: Send + Sync + 'static {
     /// Look `host` up and return one [`SocketAddr`] (with `port`) per record.
     fn lookup<'a>(&'a self, host: &'a str, port: u16) -> LookupFuture<'a>;
 }
 
 /// [`Resolver`] backed by the system resolver (`tokio::net::lookup_host`).
 #[derive(Debug, Clone, Copy, Default)]
-pub struct SystemResolver;
+pub(crate) struct SystemResolver;
 
 impl Resolver for SystemResolver {
     fn lookup<'a>(&'a self, host: &'a str, port: u16) -> LookupFuture<'a> {
@@ -68,7 +74,7 @@ impl Resolver for SystemResolver {
 ///
 /// `lookup_host` returns A and AAAA records; on a dual-stack Service one pod
 /// would be balanced twice (and the cluster here is single-stack IPv4).
-pub fn prefer_ipv4(addrs: BTreeSet<SocketAddr>) -> BTreeSet<SocketAddr> {
+pub(crate) fn prefer_ipv4(addrs: BTreeSet<SocketAddr>) -> BTreeSet<SocketAddr> {
     if addrs.iter().any(SocketAddr::is_ipv4) {
         addrs.into_iter().filter(SocketAddr::is_ipv4).collect()
     } else {
@@ -82,7 +88,7 @@ pub fn prefer_ipv4(addrs: BTreeSet<SocketAddr>) -> BTreeSet<SocketAddr> {
 /// An **empty** `new` yields no change. A lookup that returns nothing is far
 /// more likely a DNS hiccup (or every pod mid-rollout) than "the service has no
 /// backends", and dropping the last endpoints would turn a blip into an outage.
-pub fn diff_addrs(
+pub(crate) fn diff_addrs(
     old: &BTreeSet<SocketAddr>,
     new: &BTreeSet<SocketAddr>,
 ) -> (Vec<SocketAddr>, Vec<SocketAddr>) {
@@ -95,123 +101,171 @@ pub fn diff_addrs(
     )
 }
 
-/// Re-resolve `host:port` every `refresh` and feed the difference to the
-/// balancer behind `tx`, until the channel is dropped.
-///
-/// * `known` is the set already inserted (empty when the channel was created
-///   without an initial lookup); `immediate` runs the first lookup at once
-///   instead of after one `refresh`.
-/// * While no lookup has succeeded (`known` empty) a failure is retried after
-///   1s, 2s, 4s, … capped at `refresh`, not a whole `refresh` later; once an
-///   address is known the normal interval applies.
-/// * `seed_slots` > 0 means the channel holds `EndpointKey::Seed(0..seed_slots)`
-///   placeholders; they are removed right after the first real insert.
-/// * `build` turns an address into a configured [`Endpoint`]; each address gets
-///   `pool` of them keyed `(addr, 0..pool)`.
-/// * A failed, timed-out or empty lookup changes nothing (see [`diff_addrs`]).
-///   Inserts are sent before removes, so the balancer never goes empty on a
-///   full address swap.
-/// * Returns when `tx` is closed — the [`tonic::transport::Channel`] and all its
-///   clones were dropped — so the task never outlives the channel. A tick is
-///   raced against [`Sender::closed`], so it ends promptly, not at the next tick.
-///
-/// `refresh` must be non-zero.
-#[allow(clippy::too_many_arguments)]
-pub async fn run_refresher<F>(
-    resolver: Arc<dyn Resolver>,
-    host: String,
-    port: u16,
-    refresh: Duration,
-    immediate: bool,
-    pool: usize,
-    mut seed_slots: usize,
-    mut known: BTreeSet<SocketAddr>,
-    build: F,
-    tx: Sender<Change<EndpointKey, Endpoint>>,
-) where
-    F: Fn(SocketAddr) -> Result<Endpoint>,
-{
-    let mut first = immediate;
-    let mut retry = FIRST_RETRY.min(refresh);
+/// Outcome of handing one batch of changes to the balancer.
+enum Sent {
+    Ok,
+    /// The change queue is full: stop for this tick, the next one recomputes.
+    Full,
+    /// The channel is gone: the refresher must exit.
+    Closed,
+}
 
-    loop {
-        let delay = if first {
-            first = false;
-            Duration::ZERO
-        } else if known.is_empty() {
-            let d = retry;
-            retry = (retry * 2).min(refresh);
-            d
-        } else {
-            refresh
-        };
-        tokio::select! {
-            () = tx.closed() => return,
-            () = tokio::time::sleep(delay) => {}
+/// Queue `changes` all-or-nothing, without ever waiting.
+///
+/// The balancer drains its change queue only while it is being polled, which on
+/// an idle channel may be never. An awaiting `send` could therefore park the
+/// refresher forever; `try_reserve_many` either takes every slot or none, so a
+/// per-address pool is never half-applied.
+fn send_batch(tx: &Sender<Change<EndpointKey, Endpoint>>, changes: Changes) -> Sent {
+    match tx.try_reserve_many(changes.len()) {
+        Ok(permits) => {
+            for (permit, change) in permits.zip(changes) {
+                permit.send(change);
+            }
+            Sent::Ok
         }
+        Err(TrySendError::Full(())) => Sent::Full,
+        Err(TrySendError::Closed(())) => Sent::Closed,
+    }
+}
 
-        let found = match tokio::time::timeout(LOOKUP_TIMEOUT, resolver.lookup(&host, port)).await {
-            Ok(Ok(found)) => found,
-            Ok(Err(err)) => {
-                tracing::warn!(host = %host, error = %err, "pc-grpc: discovery lookup failed; keeping current endpoints");
-                continue;
-            }
-            Err(_) => {
-                tracing::warn!(host = %host, "pc-grpc: discovery lookup timed out; keeping current endpoints");
-                continue;
-            }
-        };
+/// Background re-resolution of one `host:port` into a balanced channel.
+pub(crate) struct Refresher {
+    pub(crate) resolver: Arc<dyn Resolver>,
+    pub(crate) host: String,
+    pub(crate) port: u16,
+    pub(crate) refresh: Duration,
+    /// Endpoints kept per address. Must not exceed the change-queue capacity.
+    pub(crate) pool: usize,
+    /// `EndpointKey::Seed(0..seed_slots)` placeholders currently in the
+    /// balancer; removed after the first real insert (0 = none).
+    pub(crate) seed_slots: usize,
+    /// Addresses already inserted (empty when the channel started without an
+    /// initial lookup).
+    pub(crate) known: BTreeSet<SocketAddr>,
+    pub(crate) tx: Sender<Change<EndpointKey, Endpoint>>,
+}
 
-        let (added, gone) = diff_addrs(&known, &found);
+impl Refresher {
+    /// Re-resolve every `refresh` and feed the difference to the balancer until
+    /// the channel is dropped. `refresh` must be non-zero.
+    ///
+    /// * `immediate` runs the first lookup at once instead of after one `refresh`.
+    /// * While no lookup has succeeded (`known` empty) a failure is retried after
+    ///   1s, 2s, 4s, … capped at `refresh`; once an address is known the normal
+    ///   interval applies.
+    /// * `build` turns an address into a configured [`Endpoint`].
+    /// * A failed, timed-out or empty lookup changes nothing (see [`diff_addrs`]).
+    ///   Inserts go first, removals only for addresses that leave at least one
+    ///   endpoint behind, so the balancer is never emptied (a full swap where
+    ///   every new address fails to build keeps the old ones).
+    /// * Nothing here waits on the balancer: if its change queue is full the tick
+    ///   stops and `known` reflects only what was actually queued, so the next
+    ///   tick recomputes the diff.
+    /// * Returns when the [`tonic::transport::Channel`] and all its clones are
+    ///   dropped; a pending sleep is raced against [`Sender::closed`], so that is
+    ///   prompt, not at the next tick.
+    pub(crate) async fn run<F>(mut self, immediate: bool, build: F)
+    where
+        F: Fn(SocketAddr) -> Result<Endpoint>,
+    {
+        let mut first = immediate;
+        let mut retry = FIRST_RETRY.min(self.refresh);
+
+        loop {
+            let delay = if first {
+                first = false;
+                Duration::ZERO
+            } else if self.known.is_empty() {
+                let d = retry;
+                retry = (retry * 2).min(self.refresh);
+                d
+            } else {
+                self.refresh
+            };
+            tokio::select! {
+                () = self.tx.closed() => return,
+                () = tokio::time::sleep(delay) => {}
+            }
+
+            let found = match tokio::time::timeout(
+                LOOKUP_TIMEOUT,
+                self.resolver.lookup(&self.host, self.port),
+            )
+            .await
+            {
+                Ok(Ok(found)) => found,
+                Ok(Err(err)) => {
+                    tracing::warn!(host = %self.host, error = %err, "pc-grpc: discovery lookup failed; keeping current endpoints");
+                    continue;
+                }
+                Err(_) => {
+                    tracing::warn!(host = %self.host, "pc-grpc: discovery lookup timed out; keeping current endpoints");
+                    continue;
+                }
+            };
+
+            if matches!(self.apply(&found, &build), Sent::Closed) {
+                return;
+            }
+        }
+    }
+
+    fn apply<F>(&mut self, found: &BTreeSet<SocketAddr>, build: &F) -> Sent
+    where
+        F: Fn(SocketAddr) -> Result<Endpoint>,
+    {
+        let (added, gone) = diff_addrs(&self.known, found);
+
         for addr in added {
             let endpoint = match build(addr) {
                 Ok(endpoint) => endpoint,
                 Err(err) => {
                     // Not recorded in `known`, so the next tick retries it.
-                    tracing::warn!(host = %host, %addr, error = %err, "pc-grpc: discovery cannot build endpoint");
+                    tracing::warn!(host = %self.host, %addr, error = %err, "pc-grpc: discovery cannot build endpoint");
                     continue;
                 }
             };
-            for slot in 0..pool {
-                if tx
-                    .send(Change::Insert(
-                        EndpointKey::Addr(addr, slot),
-                        endpoint.clone(),
-                    ))
-                    .await
-                    .is_err()
-                {
-                    return;
+            let batch = (0..self.pool)
+                .map(|slot| Change::Insert(EndpointKey::Addr(addr, slot), endpoint.clone()))
+                .collect();
+            match send_batch(&self.tx, batch) {
+                Sent::Ok => {
+                    self.known.insert(addr);
+                    tracing::info!(host = %self.host, added = %addr.ip(), "pc-grpc: discovery added endpoint");
+                }
+                other => return other,
+            }
+        }
+
+        // `gone` is a subset of `known`, so this is what would remain.
+        if self.known.len() > gone.len() {
+            for addr in gone {
+                let batch = (0..self.pool)
+                    .map(|slot| Change::Remove(EndpointKey::Addr(addr, slot)))
+                    .collect();
+                match send_batch(&self.tx, batch) {
+                    Sent::Ok => {
+                        self.known.remove(&addr);
+                        tracing::info!(host = %self.host, removed = %addr.ip(), "pc-grpc: discovery removed endpoint");
+                    }
+                    other => return other,
                 }
             }
-            known.insert(addr);
-            tracing::info!("pc-grpc: discovery target={host} +{}", addr.ip());
+        } else if !gone.is_empty() {
+            tracing::warn!(host = %self.host, "pc-grpc: discovery would remove every endpoint; keeping them");
         }
-        for addr in gone {
-            for slot in 0..pool {
-                if tx
-                    .send(Change::Remove(EndpointKey::Addr(addr, slot)))
-                    .await
-                    .is_err()
-                {
-                    return;
-                }
+
+        if self.seed_slots > 0 && !self.known.is_empty() {
+            let batch = (0..self.seed_slots)
+                .map(|slot| Change::Remove(EndpointKey::Seed(slot)))
+                .collect();
+            match send_batch(&self.tx, batch) {
+                Sent::Ok => self.seed_slots = 0,
+                other => return other,
             }
-            known.remove(&addr);
-            tracing::info!("pc-grpc: discovery target={host} -{}", addr.ip());
         }
-        if seed_slots > 0 && !known.is_empty() {
-            for slot in 0..seed_slots {
-                if tx
-                    .send(Change::Remove(EndpointKey::Seed(slot)))
-                    .await
-                    .is_err()
-                {
-                    return;
-                }
-            }
-            seed_slots = 0;
-        }
+        Sent::Ok
     }
 }
 
@@ -292,29 +346,42 @@ mod tests {
         Ok(Endpoint::from_shared(format!("http://{addr}"))?)
     }
 
+    type Rx = mpsc::Receiver<Change<EndpointKey, Endpoint>>;
+
+    fn refresher(
+        resolver: Arc<dyn Resolver>,
+        pool: usize,
+        known: &[&str],
+        capacity: usize,
+    ) -> (Refresher, Rx) {
+        let (tx, rx) = mpsc::channel(capacity);
+        let r = Refresher {
+            resolver,
+            host: "svc-headless".into(),
+            port: 9106,
+            refresh: Duration::from_secs(10),
+            pool,
+            seed_slots: 0,
+            known: set(known),
+            tx,
+        };
+        (r, rx)
+    }
+
     fn spawn_refresher(
         resolver: Arc<dyn Resolver>,
         pool: usize,
         known: &[&str],
-    ) -> (
-        tokio::task::JoinHandle<()>,
-        mpsc::Receiver<Change<EndpointKey, Endpoint>>,
-    ) {
-        let (tx, rx) = mpsc::channel(64);
-        let known = set(known);
-        let handle = tokio::spawn(run_refresher(
-            resolver,
-            "svc-headless".into(),
-            9106,
-            Duration::from_secs(10),
-            false,
-            pool,
-            0,
-            known,
-            build,
-            tx,
-        ));
-        (handle, rx)
+    ) -> (tokio::task::JoinHandle<()>, Rx) {
+        let (r, rx) = refresher(resolver, pool, known, 64);
+        (tokio::spawn(r.run(false, build)), rx)
+    }
+
+    /// Let the refresher task run until it is next idle.
+    async fn settle() {
+        for _ in 0..10 {
+            tokio::task::yield_now().await;
+        }
     }
 
     #[tokio::test(start_paused = true)]
@@ -340,16 +407,92 @@ mod tests {
     async fn refresher_removes_a_pod_that_left_but_not_on_empty_or_error() {
         let (a1, b) = (a("10.0.0.1:9106"), a("10.0.0.2:9106"));
         let fake = FakeResolver::new(vec![
-            Ok(vec![]),                        // empty: keep all
-            Err(io::Error::other("servfail")), // error: keep all
-            Ok(vec![b]),                       // a1 left
+            Ok(vec![]),                        // t=10s: empty: keep all
+            Err(io::Error::other("servfail")), // t=20s: error: keep all
+            Ok(vec![b]),                       // t=30s: a1 left
         ]);
+        let start = tokio::time::Instant::now();
         let (handle, mut rx) = spawn_refresher(fake, 1, &["10.0.0.1:9106", "10.0.0.2:9106"]);
 
         match rx.recv().await.expect("remove a1") {
             Change::Remove(k) => assert_eq!(k, EndpointKey::Addr(a1, 0)),
             Change::Insert(k, _) => panic!("unexpected insert {k:?}"),
         }
+        // Not at the empty (10s) or failed (20s) lookup: only the third one acts.
+        assert_eq!(start.elapsed(), Duration::from_secs(30));
+
+        // Exactly one change, now and after two more identical lookups.
+        assert!(matches!(
+            rx.try_recv(),
+            Err(mpsc::error::TryRecvError::Empty)
+        ));
+        tokio::time::advance(Duration::from_secs(25)).await;
+        settle().await;
+        assert!(matches!(
+            rx.try_recv(),
+            Err(mpsc::error::TryRecvError::Empty)
+        ));
+        handle.abort();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_swap_where_nothing_new_can_be_built_keeps_the_old_endpoints() {
+        let (a1, b) = (a("10.0.0.1:9106"), a("10.0.0.2:9106"));
+        // The answer is disjoint from `known`, and every new address fails to build.
+        let fake = FakeResolver::new(vec![Ok(vec![b])]);
+        let (r, mut rx) = refresher(fake, 1, &["10.0.0.1:9106"], 64);
+        let handle = tokio::spawn(r.run(false, |_| Err(anyhow::anyhow!("cannot build"))));
+
+        tokio::time::advance(Duration::from_secs(35)).await;
+        settle().await;
+        assert!(
+            matches!(rx.try_recv(), Err(mpsc::error::TryRecvError::Empty)),
+            "no remove may be sent when no address would remain"
+        );
+        handle.abort();
+
+        // Once the new address does build, the swap completes: insert, then remove.
+        let fake = FakeResolver::new(vec![Ok(vec![b])]);
+        let (handle, mut rx) = spawn_refresher(fake, 1, &["10.0.0.1:9106"]);
+        match rx.recv().await.unwrap() {
+            Change::Insert(k, _) => assert_eq!(k, EndpointKey::Addr(b, 0)),
+            Change::Remove(k) => panic!("insert must come first, got remove {k:?}"),
+        }
+        match rx.recv().await.unwrap() {
+            Change::Remove(k) => assert_eq!(k, EndpointKey::Addr(a1, 0)),
+            Change::Insert(k, _) => panic!("unexpected insert {k:?}"),
+        }
+        handle.abort();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_full_change_queue_never_blocks_and_the_next_tick_catches_up() {
+        let (a1, b) = (a("10.0.0.1:9106"), a("10.0.0.2:9106"));
+        // Queue holds one address's pool (2); nobody drains it, like an idle channel.
+        let fake = FakeResolver::new(vec![Ok(vec![a1, b])]);
+        let (r, mut rx) = refresher(fake, 2, &[], 2);
+        let handle = tokio::spawn(r.run(true, build));
+
+        settle().await;
+        // The refresher is not parked on a full queue: it is waiting for the next tick.
+        assert!(!handle.is_finished());
+        let mut got = Vec::new();
+        while let Ok(Change::Insert(k, _)) = rx.try_recv() {
+            got.push(k);
+        }
+        assert_eq!(
+            got,
+            vec![EndpointKey::Addr(a1, 0), EndpointKey::Addr(a1, 1)]
+        );
+
+        // Space again: the next tick inserts the address that did not fit.
+        tokio::time::advance(Duration::from_secs(15)).await;
+        settle().await;
+        let mut got = Vec::new();
+        while let Ok(Change::Insert(k, _)) = rx.try_recv() {
+            got.push(k);
+        }
+        assert_eq!(got, vec![EndpointKey::Addr(b, 0), EndpointKey::Addr(b, 1)]);
         handle.abort();
     }
 
@@ -372,20 +515,11 @@ mod tests {
             Ok(vec![]),
             Ok(vec![a1]),
         ]);
-        let (tx, mut rx) = mpsc::channel(64);
+        let (mut r, mut rx) = refresher(fake, 1, &[], 64);
+        r.refresh = Duration::from_secs(60);
+        r.seed_slots = 1;
         let start = tokio::time::Instant::now();
-        let handle = tokio::spawn(run_refresher(
-            fake,
-            "svc-headless".into(),
-            9106,
-            Duration::from_secs(60),
-            true,
-            1,
-            1,
-            BTreeSet::new(),
-            build,
-            tx,
-        ));
+        let handle = tokio::spawn(r.run(true, build));
 
         match rx.recv().await.expect("insert") {
             Change::Insert(k, _) => assert_eq!(k, EndpointKey::Addr(a1, 0)),

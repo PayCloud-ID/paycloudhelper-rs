@@ -19,3 +19,5 @@ tracing.workspace = true
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util"] }
+tonic-health = "0.14.6"
+tower.workspace = true

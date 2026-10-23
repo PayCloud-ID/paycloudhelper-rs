@@ -28,9 +28,12 @@
 //! subchannel to the pods that existed at connect time: a pod added later gets
 //! no traffic. Setting `GRPC_DNS_REFRESH_SEC` to a positive number of seconds
 //! makes [`GrpcClientFactory::connect`] / [`GrpcClientFactory::connect_lazy`]
-//! resolve the name to its A records, keep `pool` connections per address and
-//! re-resolve on that interval (see [`discovery`]). Unset or `0` is exactly the
-//! behaviour above; nothing else changes.
+//! resolve the name to its A records (IPv4 preferred), keep `pool` connections
+//! per address and re-resolve on that interval, inserting new pods and removing
+//! gone ones. The balancer is never emptied: a failed or empty lookup changes
+//! nothing. Unset or `0` is exactly the behaviour above; nothing else changes.
+//! See [`GrpcClientFactory::connect_discovered`] and
+//! [`GrpcClientFactory::connect_discovered_lazy`] for the contracts.
 //!
 //! It also provides the RC-1 shrinking-budget deadline helpers
 //! ([`child_budget`]/[`with_deadline`]): a child call's deadline is strictly
@@ -41,7 +44,7 @@
 //! that needs a live gRPC server (an actual [`GrpcClientFactory::connect`]) is
 //! `#[ignore]`d.
 
-pub mod discovery;
+mod discovery;
 
 use std::collections::BTreeSet;
 use std::net::SocketAddr;
@@ -49,10 +52,11 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{anyhow, Context, Result};
+use tonic::codegen::http::Uri;
 use tonic::transport::channel::Change;
 use tonic::transport::{Certificate, Channel, ClientTlsConfig, Endpoint};
 
-use crate::discovery::{run_refresher, EndpointKey, Resolver, SystemResolver};
+use crate::discovery::{EndpointKey, Refresher, Resolver, SystemResolver};
 
 /// Default connections-per-target for every pool.
 ///
@@ -132,10 +136,6 @@ pub struct GrpcConfig {
     pub max_idle: Duration,
     /// `GRPC_MAX_LIFE` hours (default 24) — lifetime-eviction threshold.
     pub max_life: Duration,
-    /// `GRPC_DNS_REFRESH_SEC` (default 0 = off) — how often to re-resolve the
-    /// target's A records and follow pods that joined or left. `Duration::ZERO`
-    /// keeps the fixed, resolve-once pool. No Go counterpart.
-    pub dns_refresh: Duration,
 }
 
 impl GrpcConfig {
@@ -184,7 +184,6 @@ impl GrpcConfig {
             max_life: Duration::from_secs(
                 env_parsed::<u64>("GRPC_MAX_LIFE", DEFAULT_MAX_LIFE_HOURS) * 3_600,
             ),
-            dns_refresh: parse_dns_refresh(std::env::var("GRPC_DNS_REFRESH_SEC").ok().as_deref()),
         }
     }
 
@@ -245,6 +244,10 @@ impl GrpcConfig {
 #[derive(Debug, Clone)]
 pub struct GrpcClientFactory {
     config: GrpcConfig,
+    /// `GRPC_DNS_REFRESH_SEC`; `ZERO` = discovery off. Kept beside, not inside,
+    /// [`GrpcConfig`]: adding a public field there would break downstream struct
+    /// literals.
+    dns_refresh: Duration,
 }
 
 impl GrpcClientFactory {
@@ -255,7 +258,19 @@ impl GrpcClientFactory {
     pub fn from_env() -> Result<Self> {
         Ok(Self {
             config: GrpcConfig::from_env(),
+            dns_refresh: parse_dns_refresh(std::env::var("GRPC_DNS_REFRESH_SEC").ok().as_deref()),
         })
+    }
+
+    /// Override the DNS refresh interval that `from_env` read from
+    /// `GRPC_DNS_REFRESH_SEC`: `Some(d)` turns discovery on for
+    /// [`GrpcClientFactory::connect`] / [`GrpcClientFactory::connect_lazy`],
+    /// `None` (or a zero `d`) turns it off. The explicit `refresh` argument of
+    /// [`GrpcClientFactory::connect_discovered`] always wins over this.
+    #[must_use]
+    pub fn with_dns_refresh(mut self, refresh: Option<Duration>) -> Self {
+        self.dns_refresh = refresh.unwrap_or(Duration::ZERO);
+        self
     }
 
     /// Borrow the parsed configuration.
@@ -263,9 +278,10 @@ impl GrpcClientFactory {
         &self.config
     }
 
-    /// The DNS refresh interval when discovery is on (`GRPC_DNS_REFRESH_SEC` > 0).
+    /// The DNS refresh interval when discovery is on (`GRPC_DNS_REFRESH_SEC` > 0,
+    /// or [`GrpcClientFactory::with_dns_refresh`]); `None` means the fixed pool.
     pub fn discovery_refresh(&self) -> Option<Duration> {
-        (!self.config.dns_refresh.is_zero()).then_some(self.config.dns_refresh)
+        (!self.dns_refresh.is_zero()).then_some(self.dns_refresh)
     }
 
     /// Resolve the pool size for a `*_GRPC` target env name.
@@ -368,8 +384,8 @@ impl GrpcClientFactory {
     /// is retried up to `GRPC_MAX_RETRIES` times with the usual backoff, and an
     /// error — or an empty answer — after that is returned, as is a failed
     /// prewarm of the first address. After startup a failed or empty lookup only
-    /// logs and keeps the current endpoints, and the last address is never
-    /// removed. Under TLS the original host name stays the TLS domain
+    /// logs and keeps the current endpoints, and the balancer is never
+    /// emptied. Under TLS the original host name stays the TLS domain
     /// (SNI/verification), although the connections dial IPs.
     ///
     /// The refresher is a spawned Tokio task that ends when the returned
@@ -405,7 +421,7 @@ impl GrpcClientFactory {
         let (host, port, pool) = self.discovery_target(target_env, refresh)?;
         let initial = self.initial_lookup(resolver.as_ref(), &host, port).await?;
 
-        let build = self.discovery_builder(&host);
+        let build = self.discovery_builder(&host, port);
         let first = *initial.iter().next().expect("initial_lookup is non-empty");
         self.prewarm(&build(first)?).await?;
 
@@ -415,21 +431,37 @@ impl GrpcClientFactory {
             "pc-grpc: discovery-aware round-robin channel"
         );
 
+        // Checked against the buffer, then `try_send`, so setup can never block.
+        if initial.len() * pool > DISCOVERY_BUFFER {
+            return Err(anyhow!(
+                "{} addresses x pool {pool} exceeds the discovery buffer ({DISCOVERY_BUFFER})",
+                initial.len()
+            ));
+        }
         let (channel, tx) = Channel::balance_channel(DISCOVERY_BUFFER);
         for addr in &initial {
             let endpoint = build(*addr)?;
             for slot in 0..pool {
-                tx.send(Change::Insert(
+                tx.try_send(Change::Insert(
                     EndpointKey::Addr(*addr, slot),
                     endpoint.clone(),
                 ))
-                .await
-                .map_err(|_| anyhow!("gRPC balancer closed during setup"))?;
+                .map_err(|_| anyhow!("gRPC balancer rejected an initial endpoint"))?;
             }
         }
-        tokio::spawn(run_refresher(
-            resolver, host, port, refresh, false, pool, 0, initial, build, tx,
-        ));
+        tokio::spawn(
+            Refresher {
+                resolver,
+                host,
+                port,
+                refresh,
+                pool,
+                seed_slots: 0,
+                known: initial,
+                tx,
+            }
+            .run(false, build),
+        );
         Ok(channel)
     }
 
@@ -456,19 +488,20 @@ impl GrpcClientFactory {
                 .map_err(|_| anyhow!("gRPC balancer rejected the seed endpoint"))?;
         }
 
-        let build = self.discovery_builder(&host);
-        tokio::spawn(run_refresher(
-            resolver,
-            host,
-            port,
-            refresh,
-            true,
-            pool,
-            pool,
-            BTreeSet::new(),
-            build,
-            tx,
-        ));
+        let build = self.discovery_builder(&host, port);
+        tokio::spawn(
+            Refresher {
+                resolver,
+                host,
+                port,
+                refresh,
+                pool,
+                seed_slots: pool,
+                known: BTreeSet::new(),
+                tx,
+            }
+            .run(true, build),
+        );
         Ok(channel)
     }
 
@@ -483,17 +516,41 @@ impl GrpcClientFactory {
         }
         let (target, pool) = self.resolve_target(target_env)?;
         let (host, port) = parse_host_port(&target)?;
+        if pool > DISCOVERY_BUFFER {
+            return Err(anyhow!(
+                "pool size {pool} exceeds the discovery buffer ({DISCOVERY_BUFFER})"
+            ));
+        }
         Ok((host, port, pool))
     }
 
-    /// Builds the per-address endpoint: dial the IP, keep `host` as TLS domain.
+    /// Builds the per-address endpoint: dial the IP, but keep the Service
+    /// `host` as the TLS domain and as the HTTP/2 `:authority` (via
+    /// [`Endpoint::origin`]), so servers, virtual hosts and certificates see the
+    /// name they would have seen without discovery.
     fn discovery_builder(
         &self,
         host: &str,
+        port: u16,
     ) -> impl Fn(SocketAddr) -> Result<Endpoint> + Send + 'static {
         let factory = self.clone();
         let host = host.to_string();
-        move |addr| factory.build_endpoint(&addr.to_string(), Some(&host))
+        let scheme = factory.scheme();
+        move |addr| {
+            let origin: Uri = format!("{scheme}://{host}:{port}")
+                .parse()
+                .with_context(|| format!("invalid gRPC origin for `{host}:{port}`"))?;
+            Ok(factory
+                .build_endpoint(&addr.to_string(), Some(&host))?
+                .origin(origin))
+        }
+    }
+
+    fn scheme(&self) -> &'static str {
+        match self.config.tls_mode {
+            TlsMode::Tls => "https",
+            TlsMode::Insecure => "http",
+        }
     }
 
     /// First lookup for [`GrpcClientFactory::connect_discovered`]: retried like
@@ -543,11 +600,7 @@ impl GrpcClientFactory {
     /// `tls_domain` overrides the TLS server name; discovery dials pod IPs but
     /// must still verify the certificate against the Service name.
     fn build_endpoint(&self, target: &str, tls_domain: Option<&str>) -> Result<Endpoint> {
-        let scheme = match self.config.tls_mode {
-            TlsMode::Tls => "https",
-            TlsMode::Insecure => "http",
-        };
-        let uri = format!("{scheme}://{target}");
+        let uri = format!("{}://{target}", self.scheme());
 
         let mut endpoint = Endpoint::from_shared(uri.clone())
             .with_context(|| format!("invalid gRPC endpoint `{uri}`"))?
@@ -858,7 +911,6 @@ mod tests {
             "GRPC_BACKOFF_MULTIPLIER",
             "GRPC_MAX_IDLE",
             "GRPC_MAX_LIFE",
-            "GRPC_DNS_REFRESH_SEC",
         ];
         for k in keys {
             std::env::remove_var(k);
@@ -883,7 +935,6 @@ mod tests {
         assert!((cfg.backoff_multiplier - 2.0).abs() < f64::EPSILON);
         assert_eq!(cfg.max_idle, Duration::from_secs(30 * 60));
         assert_eq!(cfg.max_life, Duration::from_secs(24 * 3_600));
-        assert_eq!(cfg.dns_refresh, Duration::ZERO, "discovery is opt-in");
 
         // Factory pool-size resolution uses the parsed defaults.
         let factory = GrpcClientFactory::from_env().unwrap();
@@ -979,6 +1030,10 @@ mod tests {
         assert_eq!(parse_dns_refresh(Some("1.5")), Duration::ZERO);
     }
 
+    fn factory_from_env() -> GrpcClientFactory {
+        GrpcClientFactory::from_env().unwrap()
+    }
+
     #[test]
     fn discovery_is_selected_only_by_a_positive_refresh() {
         let _guard = ENV_LOCK
@@ -992,165 +1047,319 @@ mod tests {
         std::env::set_var("GRPC_DNS_REFRESH_SEC", "nope");
         assert_eq!(factory_from_env().discovery_refresh(), None);
         std::env::set_var("GRPC_DNS_REFRESH_SEC", "15");
-        assert_eq!(
-            factory_from_env().discovery_refresh(),
-            Some(Duration::from_secs(15))
-        );
+        let on = factory_from_env();
+        assert_eq!(on.discovery_refresh(), Some(Duration::from_secs(15)));
         std::env::remove_var("GRPC_DNS_REFRESH_SEC");
+
+        // The builder overrides the env, in both directions.
+        assert_eq!(on.clone().with_dns_refresh(None).discovery_refresh(), None);
+        assert_eq!(
+            factory_from_env()
+                .with_dns_refresh(Some(Duration::from_secs(7)))
+                .discovery_refresh(),
+            Some(Duration::from_secs(7))
+        );
     }
 
-    fn factory_from_env() -> GrpcClientFactory {
-        GrpcClientFactory::from_env().unwrap()
-    }
+    /// Env-mutating async tests here hold `ENV_LOCK` across awaits on purpose:
+    /// they must exclude each other, and a current-thread test runtime cannot
+    /// deadlock on it.
+    mod wiring {
+        #![allow(clippy::await_holding_lock)]
 
-    use crate::discovery::LookupFuture;
+        use super::*;
+        use crate::discovery::LookupFuture;
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+        use std::sync::Mutex;
+        use tokio::sync::Notify;
+        use tonic_health::pb::health_client::HealthClient;
+        use tonic_health::pb::HealthCheckRequest;
 
-    /// Resolver returning a fixed answer, counting calls.
-    struct FixedResolver {
-        answer: Vec<SocketAddr>,
-        calls: std::sync::atomic::AtomicUsize,
-    }
+        /// Resolver returning a fixed answer, counting calls; optionally gated.
+        struct TestResolver {
+            answer: Vec<SocketAddr>,
+            open: AtomicBool,
+            calls: AtomicUsize,
+            called: Notify,
+        }
 
-    impl FixedResolver {
-        fn new(answer: &[&str]) -> Arc<Self> {
-            Arc::new(Self {
-                answer: answer.iter().map(|a| a.parse().unwrap()).collect(),
-                calls: std::sync::atomic::AtomicUsize::new(0),
+        impl TestResolver {
+            fn new(answer: &[&str], open: bool) -> Arc<Self> {
+                Arc::new(Self {
+                    answer: answer.iter().map(|a| a.parse().unwrap()).collect(),
+                    open: AtomicBool::new(open),
+                    calls: AtomicUsize::new(0),
+                    called: Notify::new(),
+                })
+            }
+            fn calls(&self) -> usize {
+                self.calls.load(Ordering::SeqCst)
+            }
+        }
+
+        impl Resolver for TestResolver {
+            fn lookup<'a>(&'a self, _host: &'a str, _port: u16) -> LookupFuture<'a> {
+                self.calls.fetch_add(1, Ordering::SeqCst);
+                self.called.notify_one();
+                let out = if self.open.load(Ordering::SeqCst) {
+                    Ok(self.answer.iter().copied().collect())
+                } else {
+                    Ok(BTreeSet::new())
+                };
+                Box::pin(async move { out })
+            }
+        }
+
+        fn quick_factory() -> GrpcClientFactory {
+            let mut f = factory_from_env();
+            f.config.max_retries = 1;
+            f
+        }
+
+        #[tokio::test]
+        async fn connect_discovered_fails_fast_on_an_empty_initial_lookup() {
+            let _guard = ENV_LOCK
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            std::env::set_var("TRANSACTION_GRPC", "svc-headless:9106");
+
+            let resolver = TestResolver::new(&[], true);
+            let err = quick_factory()
+                .connect_discovered_with(
+                    "TRANSACTION_GRPC",
+                    Duration::from_secs(30),
+                    resolver.clone(),
+                )
+                .await
+                .expect_err("no addresses must be an error, like `connect`");
+            assert!(format!("{err:#}").contains("no addresses"), "{err:#}");
+            assert_eq!(resolver.calls(), 1);
+
+            // A zero interval is rejected rather than spinning.
+            let err = quick_factory()
+                .connect_discovered_with("TRANSACTION_GRPC", Duration::ZERO, resolver)
+                .await
+                .expect_err("zero refresh");
+            assert!(format!("{err:#}").contains("non-zero"), "{err:#}");
+            std::env::remove_var("TRANSACTION_GRPC");
+        }
+
+        #[tokio::test]
+        async fn connect_discovered_prewarms_the_first_address_and_returns_a_channel() {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            tokio::spawn(async move {
+                // Hold accepted sockets open; the prewarm only needs the h2 preface to go out.
+                let mut held = Vec::new();
+                while let Ok((sock, _)) = listener.accept().await {
+                    held.push(sock);
+                }
+            });
+            let _guard = ENV_LOCK
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            std::env::set_var("TRANSACTION_GRPC", format!("svc-headless:{}", addr.port()));
+
+            let resolver = TestResolver::new(&[&addr.to_string()], true);
+            let channel = quick_factory()
+                .connect_discovered_with("TRANSACTION_GRPC", Duration::from_secs(30), resolver)
+                .await
+                .expect("discovered channel");
+            drop(channel);
+            std::env::remove_var("TRANSACTION_GRPC");
+        }
+
+        #[tokio::test]
+        async fn connect_lazy_with_refresh_does_not_resolve_at_construction() {
+            let _guard = ENV_LOCK
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            std::env::set_var("TRANSACTION_GRPC", "unresolvable.invalid:9106");
+            std::env::set_var("GRPC_DNS_REFRESH_SEC", "30");
+            let factory = factory_from_env();
+            std::env::remove_var("GRPC_DNS_REFRESH_SEC");
+
+            // Takes the discovery branch (refresh is on) and still returns
+            // synchronously, Ok, without any reachable upstream or DNS answer.
+            assert_eq!(factory.discovery_refresh(), Some(Duration::from_secs(30)));
+            let channel = factory
+                .connect_lazy("TRANSACTION_GRPC")
+                .expect("lazy discovery must not need DNS to construct");
+            drop(channel);
+            std::env::remove_var("TRANSACTION_GRPC");
+        }
+
+        #[tokio::test]
+        async fn pool_larger_than_the_discovery_buffer_is_rejected() {
+            let _guard = ENV_LOCK
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            std::env::set_var("TRANSACTION_GRPC", "svc-headless:9106");
+            std::env::set_var("GRPC_TRANSACTION_MAX_POOL", "100000");
+            let factory = factory_from_env();
+            std::env::remove_var("GRPC_TRANSACTION_MAX_POOL");
+
+            let err = factory
+                .connect_discovered_lazy("TRANSACTION_GRPC", Duration::from_secs(30))
+                .expect_err("pool that cannot fit the change queue");
+            assert!(format!("{err:#}").contains("discovery buffer"), "{err:#}");
+            std::env::remove_var("TRANSACTION_GRPC");
+        }
+
+        #[tokio::test]
+        async fn connect_discovered_lazy_resolves_in_the_background() {
+            let _guard = ENV_LOCK
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            std::env::set_var("TRANSACTION_GRPC", "svc-headless:9106");
+
+            let resolver = TestResolver::new(&["10.0.0.1:9106"], true);
+            let channel = quick_factory()
+                .connect_discovered_lazy_with(
+                    "TRANSACTION_GRPC",
+                    Duration::from_secs(30),
+                    resolver.clone(),
+                )
+                .expect("lazy discovered channel");
+            // The refresher's first lookup is immediate, off the caller's thread.
+            tokio::time::timeout(Duration::from_secs(5), resolver.called.notified())
+                .await
+                .expect("first lookup runs without waiting for a tick");
+            assert_eq!(resolver.calls(), 1);
+            drop(channel);
+            std::env::remove_var("TRANSACTION_GRPC");
+        }
+
+        /// A real tonic health server that records the `:authority` of every request.
+        struct HealthServer {
+            addr: SocketAddr,
+            authorities: Arc<Mutex<Vec<String>>>,
+        }
+
+        impl HealthServer {
+            async fn start() -> Self {
+                let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+                let addr = listener.local_addr().unwrap();
+                let authorities = Arc::new(Mutex::new(Vec::new()));
+                let seen = authorities.clone();
+                let (reporter, service) = tonic_health::server::health_reporter();
+                tokio::spawn(async move {
+                    let _reporter = reporter; // keep the reporter alive with the server
+                    let record = tower::util::MapRequestLayer::new(
+                        move |req: tonic::codegen::http::Request<_>| {
+                            let authority = req
+                                .uri()
+                                .authority()
+                                .map(ToString::to_string)
+                                .unwrap_or_default();
+                            seen.lock().unwrap().push(authority);
+                            req
+                        },
+                    );
+                    tonic::transport::Server::builder()
+                        .layer(record)
+                        .add_service(service)
+                        .serve_with_incoming(tonic::transport::server::TcpIncoming::from(listener))
+                        .await
+                });
+                Self { addr, authorities }
+            }
+
+            fn hits(&self) -> usize {
+                self.authorities.lock().unwrap().len()
+            }
+        }
+
+        async fn health_call(channel: &Channel) -> Result<(), tonic::Status> {
+            let mut client = HealthClient::new(channel.clone());
+            let call = client.check(HealthCheckRequest {
+                service: String::new(),
+            });
+            tokio::time::timeout(Duration::from_secs(5), call)
+                .await
+                .expect("a call must never hang")
+                .map(|_| ())
+        }
+
+        /// seed -> insert -> seed-remove through a real `balance_channel`.
+        #[tokio::test]
+        async fn lazy_discovery_goes_from_the_seed_to_the_resolved_pod() {
+            let seed_server = HealthServer::start().await;
+            let pod = HealthServer::start().await;
+            let _guard = ENV_LOCK
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            // The Service name is the seed server; DNS "resolves" it to the pod.
+            std::env::set_var("TRANSACTION_GRPC", seed_server.addr.to_string());
+
+            let resolver = TestResolver::new(&[&pod.addr.to_string()], false);
+            let channel = quick_factory()
+                .connect_discovered_lazy_with(
+                    "TRANSACTION_GRPC",
+                    Duration::from_secs(1),
+                    resolver.clone(),
+                )
+                .expect("lazy discovered channel");
+
+            // DNS has not answered: the seed (today's behaviour) serves the call.
+            health_call(&channel).await.expect("seed serves");
+            assert!(seed_server.hits() >= 1);
+            assert_eq!(pod.hits(), 0);
+
+            // DNS answers: traffic moves to the pod...
+            resolver.open.store(true, Ordering::SeqCst);
+            tokio::time::timeout(Duration::from_secs(10), async {
+                while pod.hits() == 0 {
+                    health_call(&channel).await.unwrap();
+                }
             })
-        }
-        fn calls(&self) -> usize {
-            self.calls.load(std::sync::atomic::Ordering::SeqCst)
-        }
-    }
-
-    impl Resolver for FixedResolver {
-        fn lookup<'a>(&'a self, _host: &'a str, _port: u16) -> LookupFuture<'a> {
-            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-            let out = self.answer.iter().copied().collect();
-            Box::pin(async move { Ok(out) })
-        }
-    }
-
-    fn quick_factory() -> GrpcClientFactory {
-        let mut f = factory_from_env();
-        f.config.max_retries = 1;
-        f
-    }
-
-    // Env-mutating tests hold ENV_LOCK across awaits on purpose: they must
-    // exclude each other, and a current-thread test runtime cannot deadlock on it.
-    #[allow(clippy::await_holding_lock)]
-    #[tokio::test]
-    async fn connect_discovered_fails_fast_on_an_empty_initial_lookup() {
-        let _guard = ENV_LOCK
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        std::env::set_var("TRANSACTION_GRPC", "svc-headless:9106");
-
-        let resolver = FixedResolver::new(&[]);
-        let err = quick_factory()
-            .connect_discovered_with(
-                "TRANSACTION_GRPC",
-                Duration::from_secs(30),
-                resolver.clone(),
-            )
             .await
-            .expect_err("no addresses must be an error, like `connect`");
-        assert!(format!("{err:#}").contains("no addresses"), "{err:#}");
-        assert_eq!(resolver.calls(), 1);
+            .expect("the resolved pod receives traffic");
 
-        // A zero interval is rejected rather than spinning.
-        let err = quick_factory()
-            .connect_discovered_with("TRANSACTION_GRPC", Duration::ZERO, resolver)
-            .await
-            .expect_err("zero refresh");
-        assert!(format!("{err:#}").contains("non-zero"), "{err:#}");
-        std::env::remove_var("TRANSACTION_GRPC");
-    }
-
-    // Env-mutating tests hold ENV_LOCK across awaits on purpose: they must
-    // exclude each other, and a current-thread test runtime cannot deadlock on it.
-    #[allow(clippy::await_holding_lock)]
-    #[tokio::test]
-    async fn connect_discovered_prewarms_the_first_address_and_returns_a_channel() {
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        tokio::spawn(async move {
-            // Hold accepted sockets open; the prewarm only needs the TCP/h2 preface to go out.
-            let mut held = Vec::new();
-            while let Ok((sock, _)) = listener.accept().await {
-                held.push(sock);
+            // ...and, once the seed is removed, only there.
+            for _ in 0..5 {
+                health_call(&channel).await.unwrap();
             }
-        });
-        let _guard = ENV_LOCK
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        std::env::set_var("TRANSACTION_GRPC", format!("svc-headless:{}", addr.port()));
-
-        let resolver = FixedResolver::new(&[&addr.to_string()]);
-        let channel = quick_factory()
-            .connect_discovered_with("TRANSACTION_GRPC", Duration::from_secs(30), resolver)
-            .await
-            .expect("discovered channel");
-        drop(channel);
-        std::env::remove_var("TRANSACTION_GRPC");
-    }
-
-    // Env-mutating tests hold ENV_LOCK across awaits on purpose: they must
-    // exclude each other, and a current-thread test runtime cannot deadlock on it.
-    #[allow(clippy::await_holding_lock)]
-    #[tokio::test]
-    async fn connect_lazy_with_refresh_does_not_resolve_at_construction() {
-        let _guard = ENV_LOCK
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        std::env::set_var("TRANSACTION_GRPC", "unresolvable.invalid:9106");
-        std::env::set_var("GRPC_DNS_REFRESH_SEC", "30");
-        let factory = factory_from_env();
-        std::env::remove_var("GRPC_DNS_REFRESH_SEC");
-
-        // Takes the discovery branch (refresh is on) and still returns
-        // synchronously, Ok, without any reachable upstream or DNS answer.
-        assert_eq!(factory.discovery_refresh(), Some(Duration::from_secs(30)));
-        let channel = factory
-            .connect_lazy("TRANSACTION_GRPC")
-            .expect("lazy discovery must not need DNS to construct");
-        drop(channel);
-        std::env::remove_var("TRANSACTION_GRPC");
-    }
-
-    // Env-mutating tests hold ENV_LOCK across awaits on purpose: they must
-    // exclude each other, and a current-thread test runtime cannot deadlock on it.
-    #[allow(clippy::await_holding_lock)]
-    #[tokio::test]
-    async fn connect_discovered_lazy_resolves_in_the_background() {
-        let _guard = ENV_LOCK
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        std::env::set_var("TRANSACTION_GRPC", "svc-headless:9106");
-
-        let resolver = FixedResolver::new(&["10.0.0.1:9106"]);
-        let channel = quick_factory()
-            .connect_discovered_lazy_with(
-                "TRANSACTION_GRPC",
-                Duration::from_secs(30),
-                resolver.clone(),
-            )
-            .expect("lazy discovered channel");
-        // The refresher's first lookup is immediate, off the caller's thread.
-        for _ in 0..50 {
-            if resolver.calls() > 0 {
-                break;
+            let seed_hits = seed_server.hits();
+            let pod_hits = pod.hits();
+            for _ in 0..20 {
+                health_call(&channel).await.unwrap();
             }
-            tokio::time::sleep(Duration::from_millis(10)).await;
+            assert_eq!(seed_server.hits(), seed_hits, "seed must be gone");
+            assert_eq!(pod.hits(), pod_hits + 20);
+
+            // `:authority` stays the Service name, not the pod IP:port.
+            let expected = seed_server.addr.to_string();
+            assert!(pod
+                .authorities
+                .lock()
+                .unwrap()
+                .iter()
+                .all(|a| *a == expected));
+            std::env::remove_var("TRANSACTION_GRPC");
         }
-        assert_eq!(
-            resolver.calls(),
-            1,
-            "first lookup runs without waiting a tick"
-        );
-        drop(channel);
-        std::env::remove_var("TRANSACTION_GRPC");
+
+        #[tokio::test]
+        async fn lazy_discovery_with_no_dns_and_a_dead_seed_fails_fast_not_hangs() {
+            let dead = {
+                let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+                l.local_addr().unwrap()
+            };
+            let _guard = ENV_LOCK
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            std::env::set_var("TRANSACTION_GRPC", dead.to_string());
+
+            let resolver = TestResolver::new(&[], true); // always empty
+            let channel = quick_factory()
+                .connect_discovered_lazy_with("TRANSACTION_GRPC", Duration::from_secs(30), resolver)
+                .unwrap();
+            let status = health_call(&channel)
+                .await
+                .expect_err("nothing is listening");
+            assert_eq!(status.code(), tonic::Code::Unavailable);
+            std::env::remove_var("TRANSACTION_GRPC");
+        }
     }
 
     #[tokio::test]
