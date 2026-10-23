@@ -20,13 +20,22 @@ use std::time::Duration;
 
 use anyhow::Result;
 use tokio::sync::mpsc::Sender;
-use tokio::time::{interval_at, Instant, MissedTickBehavior};
 use tonic::transport::channel::Change;
 use tonic::transport::Endpoint;
 
-/// Key of one balanced endpoint: the pod address plus its slot within the
-/// per-address pool of `pool` connections.
-pub type EndpointKey = (SocketAddr, usize);
+/// Key of one balanced endpoint.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum EndpointKey {
+    /// Slot `n` of the plain host-name endpoint a lazy channel starts with, so
+    /// a call never waits on an empty balancer. Removed once real addresses
+    /// have been inserted.
+    Seed(usize),
+    /// Slot `n` (of `pool`) of one resolved pod address.
+    Addr(SocketAddr, usize),
+}
+
+/// First retry delay while no lookup has succeeded yet; doubles up to `refresh`.
+const FIRST_RETRY: Duration = Duration::from_secs(1);
 
 /// Upper bound on one DNS lookup. `getaddrinfo` runs on the blocking pool and
 /// can hang; a stuck lookup must not wedge the refresher forever.
@@ -50,8 +59,20 @@ impl Resolver for SystemResolver {
     fn lookup<'a>(&'a self, host: &'a str, port: u16) -> LookupFuture<'a> {
         Box::pin(async move {
             let addrs = tokio::net::lookup_host((host, port)).await?;
-            Ok(addrs.collect())
+            Ok(prefer_ipv4(addrs.collect()))
         })
+    }
+}
+
+/// Keep only the IPv4 addresses when there is any, otherwise all of them.
+///
+/// `lookup_host` returns A and AAAA records; on a dual-stack Service one pod
+/// would be balanced twice (and the cluster here is single-stack IPv4).
+pub fn prefer_ipv4(addrs: BTreeSet<SocketAddr>) -> BTreeSet<SocketAddr> {
+    if addrs.iter().any(SocketAddr::is_ipv4) {
+        addrs.into_iter().filter(SocketAddr::is_ipv4).collect()
+    } else {
+        addrs
     }
 }
 
@@ -80,6 +101,11 @@ pub fn diff_addrs(
 /// * `known` is the set already inserted (empty when the channel was created
 ///   without an initial lookup); `immediate` runs the first lookup at once
 ///   instead of after one `refresh`.
+/// * While no lookup has succeeded (`known` empty) a failure is retried after
+///   1s, 2s, 4s, … capped at `refresh`, not a whole `refresh` later; once an
+///   address is known the normal interval applies.
+/// * `seed_slots` > 0 means the channel holds `EndpointKey::Seed(0..seed_slots)`
+///   placeholders; they are removed right after the first real insert.
 /// * `build` turns an address into a configured [`Endpoint`]; each address gets
 ///   `pool` of them keyed `(addr, 0..pool)`.
 /// * A failed, timed-out or empty lookup changes nothing (see [`diff_addrs`]).
@@ -98,24 +124,30 @@ pub async fn run_refresher<F>(
     refresh: Duration,
     immediate: bool,
     pool: usize,
+    mut seed_slots: usize,
     mut known: BTreeSet<SocketAddr>,
     build: F,
     tx: Sender<Change<EndpointKey, Endpoint>>,
 ) where
     F: Fn(SocketAddr) -> Result<Endpoint>,
 {
-    let start = if immediate {
-        Instant::now()
-    } else {
-        Instant::now() + refresh
-    };
-    let mut ticker = interval_at(start, refresh);
-    ticker.set_missed_tick_behavior(MissedTickBehavior::Delay);
+    let mut first = immediate;
+    let mut retry = FIRST_RETRY.min(refresh);
 
     loop {
+        let delay = if first {
+            first = false;
+            Duration::ZERO
+        } else if known.is_empty() {
+            let d = retry;
+            retry = (retry * 2).min(refresh);
+            d
+        } else {
+            refresh
+        };
         tokio::select! {
             () = tx.closed() => return,
-            _ = ticker.tick() => {}
+            () = tokio::time::sleep(delay) => {}
         }
 
         let found = match tokio::time::timeout(LOOKUP_TIMEOUT, resolver.lookup(&host, port)).await {
@@ -142,7 +174,10 @@ pub async fn run_refresher<F>(
             };
             for slot in 0..pool {
                 if tx
-                    .send(Change::Insert((addr, slot), endpoint.clone()))
+                    .send(Change::Insert(
+                        EndpointKey::Addr(addr, slot),
+                        endpoint.clone(),
+                    ))
                     .await
                     .is_err()
                 {
@@ -150,16 +185,32 @@ pub async fn run_refresher<F>(
                 }
             }
             known.insert(addr);
-            tracing::info!(host = %host, "pc-grpc: discovery target={host} +{}", addr.ip());
+            tracing::info!("pc-grpc: discovery target={host} +{}", addr.ip());
         }
         for addr in gone {
             for slot in 0..pool {
-                if tx.send(Change::Remove((addr, slot))).await.is_err() {
+                if tx
+                    .send(Change::Remove(EndpointKey::Addr(addr, slot)))
+                    .await
+                    .is_err()
+                {
                     return;
                 }
             }
             known.remove(&addr);
-            tracing::info!(host = %host, "pc-grpc: discovery target={host} -{}", addr.ip());
+            tracing::info!("pc-grpc: discovery target={host} -{}", addr.ip());
+        }
+        if seed_slots > 0 && !known.is_empty() {
+            for slot in 0..seed_slots {
+                if tx
+                    .send(Change::Remove(EndpointKey::Seed(slot)))
+                    .await
+                    .is_err()
+                {
+                    return;
+                }
+            }
+            seed_slots = 0;
         }
     }
 }
@@ -258,6 +309,7 @@ mod tests {
             Duration::from_secs(10),
             false,
             pool,
+            0,
             known,
             build,
             tx,
@@ -280,7 +332,7 @@ mod tests {
                 Change::Remove(k) => panic!("unexpected remove {k:?}"),
             }
         }
-        assert_eq!(keys, vec![(b, 0), (b, 1)]);
+        assert_eq!(keys, vec![EndpointKey::Addr(b, 0), EndpointKey::Addr(b, 1)]);
         handle.abort();
     }
 
@@ -295,7 +347,7 @@ mod tests {
         let (handle, mut rx) = spawn_refresher(fake, 1, &["10.0.0.1:9106", "10.0.0.2:9106"]);
 
         match rx.recv().await.expect("remove a1") {
-            Change::Remove(k) => assert_eq!(k, (a1, 0)),
+            Change::Remove(k) => assert_eq!(k, EndpointKey::Addr(a1, 0)),
             Change::Insert(k, _) => panic!("unexpected insert {k:?}"),
         }
         handle.abort();
@@ -310,5 +362,52 @@ mod tests {
             .await
             .expect("refresher must stop once the balancer is gone")
             .unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn first_lookup_is_retried_with_backoff_not_a_full_interval_later() {
+        let a1 = a("10.0.0.1:9106");
+        let fake = FakeResolver::new(vec![
+            Err(io::Error::other("nxdomain")),
+            Ok(vec![]),
+            Ok(vec![a1]),
+        ]);
+        let (tx, mut rx) = mpsc::channel(64);
+        let start = tokio::time::Instant::now();
+        let handle = tokio::spawn(run_refresher(
+            fake,
+            "svc-headless".into(),
+            9106,
+            Duration::from_secs(60),
+            true,
+            1,
+            1,
+            BTreeSet::new(),
+            build,
+            tx,
+        ));
+
+        match rx.recv().await.expect("insert") {
+            Change::Insert(k, _) => assert_eq!(k, EndpointKey::Addr(a1, 0)),
+            Change::Remove(k) => panic!("unexpected remove {k:?}"),
+        }
+        // t=0 fail, +1s empty, +2s success: 3s, not 120s.
+        assert_eq!(start.elapsed(), Duration::from_secs(3));
+
+        // The placeholder goes only after the real endpoint is in.
+        match rx.recv().await.expect("seed removal") {
+            Change::Remove(k) => assert_eq!(k, EndpointKey::Seed(0)),
+            Change::Insert(k, _) => panic!("unexpected insert {k:?}"),
+        }
+        handle.abort();
+    }
+
+    #[test]
+    fn dual_stack_answers_keep_only_ipv4() {
+        let mixed = set(&["10.0.0.1:9106", "[fd00::1]:9106", "10.0.0.2:9106"]);
+        assert_eq!(prefer_ipv4(mixed), set(&["10.0.0.1:9106", "10.0.0.2:9106"]));
+        // IPv6-only is left alone rather than emptied.
+        let v6 = set(&["[fd00::1]:9106"]);
+        assert_eq!(prefer_ipv4(v6.clone()), v6);
     }
 }

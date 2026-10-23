@@ -52,7 +52,7 @@ use anyhow::{anyhow, Context, Result};
 use tonic::transport::channel::Change;
 use tonic::transport::{Certificate, Channel, ClientTlsConfig, Endpoint};
 
-use crate::discovery::{run_refresher, Resolver, SystemResolver};
+use crate::discovery::{run_refresher, EndpointKey, Resolver, SystemResolver};
 
 /// Default connections-per-target for every pool.
 ///
@@ -382,14 +382,16 @@ impl GrpcClientFactory {
     /// The no-boot-failure counterpart of [`GrpcClientFactory::connect_discovered`],
     /// for [`GrpcClientFactory::connect_lazy`] callers.
     ///
-    /// Synchronous and never touches DNS itself: the channel starts with **no**
-    /// endpoints and the refresher task does the first lookup immediately, then
-    /// retries every `refresh` until it gets a non-empty answer. Until then a
-    /// call waits for a ready endpoint (bounded by the caller's deadline, e.g.
-    /// [`with_deadline`]) instead of failing `UNAVAILABLE` as the plain lazy
-    /// pool does against an unresolvable name. In the normal case that window
-    /// is one DNS round trip. Must be called inside a Tokio runtime, like
-    /// `connect_lazy`.
+    /// Synchronous and never touches DNS itself. The channel starts with the
+    /// plain host-name pool (`pool` endpoints on the Service name, exactly what
+    /// [`GrpcClientFactory::connect_lazy`] builds without discovery), so a call
+    /// made before DNS answers — or while it never does — fails fast with
+    /// `UNAVAILABLE` instead of waiting on an empty balancer, deadline or not.
+    /// The refresher's first lookup runs at once in the background; if it fails
+    /// or comes back empty it is retried after 1s, 2s, 4s, … (capped at
+    /// `refresh`) until it succeeds, and on that first success the per-address
+    /// endpoints are inserted and the host-name seed is removed. Must be called
+    /// inside a Tokio runtime, like `connect_lazy`.
     pub fn connect_discovered_lazy(&self, target_env: &str, refresh: Duration) -> Result<Channel> {
         self.connect_discovered_lazy_with(target_env, refresh, Arc::new(SystemResolver))
     }
@@ -417,13 +419,16 @@ impl GrpcClientFactory {
         for addr in &initial {
             let endpoint = build(*addr)?;
             for slot in 0..pool {
-                tx.send(Change::Insert((*addr, slot), endpoint.clone()))
-                    .await
-                    .map_err(|_| anyhow!("gRPC balancer closed during setup"))?;
+                tx.send(Change::Insert(
+                    EndpointKey::Addr(*addr, slot),
+                    endpoint.clone(),
+                ))
+                .await
+                .map_err(|_| anyhow!("gRPC balancer closed during setup"))?;
             }
         }
         tokio::spawn(run_refresher(
-            resolver, host, port, refresh, false, pool, initial, build, tx,
+            resolver, host, port, refresh, false, pool, 0, initial, build, tx,
         ));
         Ok(channel)
     }
@@ -440,6 +445,17 @@ impl GrpcClientFactory {
             "pc-grpc: lazy discovery-aware round-robin channel (no prewarm)"
         );
         let (channel, tx) = Channel::balance_channel(DISCOVERY_BUFFER);
+
+        // Seed with today's plain host-name pool so the balancer is never empty:
+        // until the first lookup lands (or if it never does) calls behave exactly
+        // like the non-discovery lazy path, including failing fast with
+        // `UNAVAILABLE`. The refresher drops the seed after its first real insert.
+        let seed = self.build_endpoint(&dial_target(&host, port), None)?;
+        for slot in 0..pool {
+            tx.try_send(Change::Insert(EndpointKey::Seed(slot), seed.clone()))
+                .map_err(|_| anyhow!("gRPC balancer rejected the seed endpoint"))?;
+        }
+
         let build = self.discovery_builder(&host);
         tokio::spawn(run_refresher(
             resolver,
@@ -447,6 +463,7 @@ impl GrpcClientFactory {
             port,
             refresh,
             true,
+            pool,
             pool,
             BTreeSet::new(),
             build,
