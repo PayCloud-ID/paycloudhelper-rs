@@ -2564,7 +2564,7 @@ dependencies = [
 
 [[package]]
 name = "paycloudhelper"
-version = "1.5.1"
+version = "1.6.0"
 dependencies = [
  "anyhow",
  "pc-amqp",
@@ -2599,7 +2599,7 @@ dependencies = [
 
 [[package]]
 name = "pc-amqp"
-version = "1.5.1"
+version = "1.6.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -2613,7 +2613,7 @@ dependencies = [
 
 [[package]]
 name = "pc-audit"
-version = "1.5.1"
+version = "1.6.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -2630,7 +2630,7 @@ dependencies = [
 
 [[package]]
 name = "pc-auth"
-version = "1.5.1"
+version = "1.6.0"
 dependencies = [
  "axum",
  "hex",
@@ -2648,7 +2648,7 @@ dependencies = [
 
 [[package]]
 name = "pc-config"
-version = "1.5.1"
+version = "1.6.0"
 dependencies = [
  "dotenvy",
  "pc-core",
@@ -2658,7 +2658,7 @@ dependencies = [
 
 [[package]]
 name = "pc-core"
-version = "1.5.1"
+version = "1.6.0"
 dependencies = [
  "anyhow",
  "serde",
@@ -2668,7 +2668,7 @@ dependencies = [
 
 [[package]]
 name = "pc-db"
-version = "1.5.1"
+version = "1.6.0"
 dependencies = [
  "pc-log",
  "rand 0.10.2",
@@ -2679,7 +2679,7 @@ dependencies = [
 
 [[package]]
 name = "pc-grpc"
-version = "1.5.1"
+version = "1.6.0"
 dependencies = [
  "anyhow",
  "pc-core",
@@ -2692,7 +2692,7 @@ dependencies = [
 
 [[package]]
 name = "pc-health"
-version = "1.5.1"
+version = "1.6.0"
 dependencies = [
  "pc-amqp",
  "pc-core",
@@ -2706,7 +2706,7 @@ dependencies = [
 
 [[package]]
 name = "pc-http"
-version = "1.5.1"
+version = "1.6.0"
 dependencies = [
  "anyhow",
  "axum",
@@ -2722,7 +2722,7 @@ dependencies = [
 
 [[package]]
 name = "pc-json"
-version = "1.5.1"
+version = "1.6.0"
 dependencies = [
  "pc-core",
  "serde",
@@ -2731,7 +2731,7 @@ dependencies = [
 
 [[package]]
 name = "pc-log"
-version = "1.5.1"
+version = "1.6.0"
 dependencies = [
  "dashmap",
  "governor",
@@ -2743,7 +2743,7 @@ dependencies = [
 
 [[package]]
 name = "pc-redis"
-version = "1.5.1"
+version = "1.6.0"
 dependencies = [
  "anyhow",
  "deadpool-redis",
@@ -2758,7 +2758,7 @@ dependencies = [
 
 [[package]]
 name = "pc-resilience"
-version = "1.5.1"
+version = "1.6.0"
 dependencies = [
  "dashmap",
  "futures",
@@ -2770,7 +2770,7 @@ dependencies = [
 
 [[package]]
 name = "pc-s3minio"
-version = "1.5.1"
+version = "1.6.0"
 dependencies = [
  "async-trait",
  "reqwest",
@@ -2783,7 +2783,7 @@ dependencies = [
 
 [[package]]
 name = "pc-sentry"
-version = "1.5.1"
+version = "1.6.0"
 dependencies = [
  "pc-core",
  "pc-log",
@@ -2795,7 +2795,7 @@ dependencies = [
 
 [[package]]
 name = "pc-snapbi"
-version = "1.5.1"
+version = "1.6.0"
 dependencies = [
  "aes-gcm",
  "anyhow",
@@ -2814,7 +2814,7 @@ dependencies = [
 
 [[package]]
 name = "pc-trace"
-version = "1.5.1"
+version = "1.6.0"
 dependencies = [
  "anyhow",
  "lapin",
@@ -2828,7 +2828,7 @@ dependencies = [
 
 [[package]]
 name = "pc-validate"
-version = "1.5.1"
+version = "1.6.0"
 dependencies = [
  "pc-core",
  "regex",
@@ -5059,7 +5059,7 @@ dependencies = [
 
 [[package]]
 name = "xtask"
-version = "1.5.1"
+version = "1.6.0"
 
 [[package]]
 name = "xxhash-rust"
