@@ -30,6 +30,8 @@
 //! that needs a live gRPC server (an actual [`GrpcClientFactory::connect`]) is
 //! `#[ignore]`d.
 
+pub mod discovery;
+
 use std::time::Duration;
 
 use anyhow::{anyhow, Context, Result};
