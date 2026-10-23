@@ -21,6 +21,17 @@
 //! probe, for services that must boot degraded instead of refusing to start.
 //! Neither needs the caller to rebuild endpoints by hand.
 //!
+//! # DNS discovery (`GRPC_DNS_REFRESH_SEC`)
+//!
+//! By default the pool is `pool` subchannels on one DNS name, each resolving
+//! that name once. Against a Kubernetes **headless** Service that pins every
+//! subchannel to the pods that existed at connect time: a pod added later gets
+//! no traffic. Setting `GRPC_DNS_REFRESH_SEC` to a positive number of seconds
+//! makes [`GrpcClientFactory::connect`] / [`GrpcClientFactory::connect_lazy`]
+//! resolve the name to its A records, keep `pool` connections per address and
+//! re-resolve on that interval (see [`discovery`]). Unset or `0` is exactly the
+//! behaviour above; nothing else changes.
+//!
 //! It also provides the RC-1 shrinking-budget deadline helpers
 //! ([`child_budget`]/[`with_deadline`]): a child call's deadline is strictly
 //! less than the wall budget so it always expires first.
@@ -121,6 +132,10 @@ pub struct GrpcConfig {
     pub max_idle: Duration,
     /// `GRPC_MAX_LIFE` hours (default 24) — lifetime-eviction threshold.
     pub max_life: Duration,
+    /// `GRPC_DNS_REFRESH_SEC` (default 0 = off) — how often to re-resolve the
+    /// target's A records and follow pods that joined or left. `Duration::ZERO`
+    /// keeps the fixed, resolve-once pool. No Go counterpart.
+    pub dns_refresh: Duration,
 }
 
 impl GrpcConfig {
@@ -169,6 +184,7 @@ impl GrpcConfig {
             max_life: Duration::from_secs(
                 env_parsed::<u64>("GRPC_MAX_LIFE", DEFAULT_MAX_LIFE_HOURS) * 3_600,
             ),
+            dns_refresh: parse_dns_refresh(std::env::var("GRPC_DNS_REFRESH_SEC").ok().as_deref()),
         }
     }
 
@@ -247,6 +263,11 @@ impl GrpcClientFactory {
         &self.config
     }
 
+    /// The DNS refresh interval when discovery is on (`GRPC_DNS_REFRESH_SEC` > 0).
+    pub fn discovery_refresh(&self) -> Option<Duration> {
+        (!self.config.dns_refresh.is_zero()).then_some(self.config.dns_refresh)
+    }
+
     /// Resolve the pool size for a `*_GRPC` target env name.
     ///
     /// mirrors: `NewGrpcManager` wiring `Transaction`/`Merchant`/`Config` pools
@@ -271,10 +292,16 @@ impl GrpcClientFactory {
     /// `GRPC_MAX_RETRIES` (needs a live server — this is why any real `connect`
     /// test is `#[ignore]`d).
     ///
+    /// With `GRPC_DNS_REFRESH_SEC` > 0 this is [`GrpcClientFactory::connect_discovered`]
+    /// (same fail-fast contract, but the pool follows the Service's A records).
+    ///
     /// mirrors: `GrpcClientPool.GetConnection` + `createConnection` (round-robin
     /// pool, retry-with-backoff establishment) over the target that
     /// `GrpcManager.initializeConnections` dials.
     pub async fn connect(&self, target_env: &str) -> Result<Channel> {
+        if let Some(refresh) = self.discovery_refresh() {
+            return self.connect_discovered(target_env, refresh).await;
+        }
         let (target, pool) = self.resolve_target(target_env)?;
         let endpoint = self.build_endpoint(&target, None)?;
 
@@ -310,7 +337,14 @@ impl GrpcClientFactory {
     /// mirrors: `createConnection` with the retry loop skipped — the same
     /// `grpc.DialOption` set and `maxConn` round-robin pool that
     /// `GrpcManager.initializeConnections` builds.
+    ///
+    /// With `GRPC_DNS_REFRESH_SEC` > 0 this is
+    /// [`GrpcClientFactory::connect_discovered_lazy`]: still synchronous and
+    /// still no DNS at construction (the first lookup happens in the background).
     pub fn connect_lazy(&self, target_env: &str) -> Result<Channel> {
+        if let Some(refresh) = self.discovery_refresh() {
+            return self.connect_discovered_lazy(target_env, refresh);
+        }
         let (target, pool) = self.resolve_target(target_env)?;
         let endpoint = self.build_endpoint(&target, None)?;
 
@@ -636,6 +670,22 @@ pub fn with_deadline<T>(req: &mut tonic::Request<T>, budget: Duration) {
     req.set_timeout(child_budget(budget));
 }
 
+/// Parse `GRPC_DNS_REFRESH_SEC`: unset, empty or `0` is off; anything that is not
+/// a non-negative whole number of seconds is treated as off, with a warning.
+fn parse_dns_refresh(raw: Option<&str>) -> Duration {
+    let Some(raw) = raw.map(str::trim).filter(|v| !v.is_empty()) else {
+        return Duration::ZERO;
+    };
+    if let Ok(secs) = raw.parse::<u64>() {
+        return Duration::from_secs(secs);
+    }
+    tracing::warn!(
+        value = raw,
+        "pc-grpc: invalid GRPC_DNS_REFRESH_SEC; DNS discovery stays off"
+    );
+    Duration::ZERO
+}
+
 // ---- private env helpers (mirror helpers.getEnvInt/getEnvFloat/getEnvBool/getEnvOrDefault) ----
 
 /// Parse `key` as `T`, falling back to `default` when unset, empty or invalid.
@@ -791,6 +841,7 @@ mod tests {
             "GRPC_BACKOFF_MULTIPLIER",
             "GRPC_MAX_IDLE",
             "GRPC_MAX_LIFE",
+            "GRPC_DNS_REFRESH_SEC",
         ];
         for k in keys {
             std::env::remove_var(k);
@@ -815,6 +866,7 @@ mod tests {
         assert!((cfg.backoff_multiplier - 2.0).abs() < f64::EPSILON);
         assert_eq!(cfg.max_idle, Duration::from_secs(30 * 60));
         assert_eq!(cfg.max_life, Duration::from_secs(24 * 3_600));
+        assert_eq!(cfg.dns_refresh, Duration::ZERO, "discovery is opt-in");
 
         // Factory pool-size resolution uses the parsed defaults.
         let factory = GrpcClientFactory::from_env().unwrap();
@@ -895,6 +947,40 @@ mod tests {
     }
 
     // ---- DNS discovery wiring (GRPC_DNS_REFRESH_SEC) ----
+
+    #[test]
+    fn dns_refresh_parsing_defaults_off_and_warns_on_garbage() {
+        assert_eq!(parse_dns_refresh(None), Duration::ZERO);
+        assert_eq!(parse_dns_refresh(Some("")), Duration::ZERO);
+        assert_eq!(parse_dns_refresh(Some("  ")), Duration::ZERO);
+        assert_eq!(parse_dns_refresh(Some("0")), Duration::ZERO);
+        assert_eq!(parse_dns_refresh(Some("30")), Duration::from_secs(30));
+        assert_eq!(parse_dns_refresh(Some(" 5 ")), Duration::from_secs(5));
+        // Invalid values do not enable discovery.
+        assert_eq!(parse_dns_refresh(Some("abc")), Duration::ZERO);
+        assert_eq!(parse_dns_refresh(Some("-3")), Duration::ZERO);
+        assert_eq!(parse_dns_refresh(Some("1.5")), Duration::ZERO);
+    }
+
+    #[test]
+    fn discovery_is_selected_only_by_a_positive_refresh() {
+        let _guard = ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+
+        std::env::remove_var("GRPC_DNS_REFRESH_SEC");
+        assert_eq!(factory_from_env().discovery_refresh(), None);
+        std::env::set_var("GRPC_DNS_REFRESH_SEC", "0");
+        assert_eq!(factory_from_env().discovery_refresh(), None);
+        std::env::set_var("GRPC_DNS_REFRESH_SEC", "nope");
+        assert_eq!(factory_from_env().discovery_refresh(), None);
+        std::env::set_var("GRPC_DNS_REFRESH_SEC", "15");
+        assert_eq!(
+            factory_from_env().discovery_refresh(),
+            Some(Duration::from_secs(15))
+        );
+        std::env::remove_var("GRPC_DNS_REFRESH_SEC");
+    }
 
     fn factory_from_env() -> GrpcClientFactory {
         GrpcClientFactory::from_env().unwrap()
@@ -989,6 +1075,29 @@ mod tests {
             .connect_discovered_with("TRANSACTION_GRPC", Duration::from_secs(30), resolver)
             .await
             .expect("discovered channel");
+        drop(channel);
+        std::env::remove_var("TRANSACTION_GRPC");
+    }
+
+    // Env-mutating tests hold ENV_LOCK across awaits on purpose: they must
+    // exclude each other, and a current-thread test runtime cannot deadlock on it.
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    async fn connect_lazy_with_refresh_does_not_resolve_at_construction() {
+        let _guard = ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        std::env::set_var("TRANSACTION_GRPC", "unresolvable.invalid:9106");
+        std::env::set_var("GRPC_DNS_REFRESH_SEC", "30");
+        let factory = factory_from_env();
+        std::env::remove_var("GRPC_DNS_REFRESH_SEC");
+
+        // Takes the discovery branch (refresh is on) and still returns
+        // synchronously, Ok, without any reachable upstream or DNS answer.
+        assert_eq!(factory.discovery_refresh(), Some(Duration::from_secs(30)));
+        let channel = factory
+            .connect_lazy("TRANSACTION_GRPC")
+            .expect("lazy discovery must not need DNS to construct");
         drop(channel);
         std::env::remove_var("TRANSACTION_GRPC");
     }

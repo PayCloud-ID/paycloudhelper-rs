@@ -19,6 +19,18 @@ recorded here with the reason.
 ## [Unreleased]
 
 ### Added
+- `pc-grpc` DNS discovery for headless Services. `GrpcClientFactory::connect_discovered`
+  / `connect_discovered_lazy` resolve the target host to its A records, keep
+  `pool` balanced connections per address and re-resolve on an interval,
+  inserting new pods and removing gone ones (an empty or failed lookup changes
+  nothing, the last address is never removed, and the refresher task ends with
+  the `Channel`). `connect` and `connect_lazy` switch to it when
+  `GRPC_DNS_REFRESH_SEC` is a positive number of seconds; unset or `0` is
+  exactly the previous behaviour. Before, every subchannel resolved the
+  headless name once at connect time and stayed on that pod, so a pod added
+  later (a scale-up) received no traffic from an already-running caller. Pure
+  pieces: `pc_grpc::discovery::{diff_addrs, Resolver, run_refresher}`.
+  `GrpcConfig` gains a public `dns_refresh` field.
 - `pc-amqp::AmqpClient::publish_to` (arbitrary routing key + caller properties)
   and `AmqpClient::reply` (answer a delivery on its own `reply_to` queue,
   inheriting the requester's correlation ID). The queue-bound publishers could
