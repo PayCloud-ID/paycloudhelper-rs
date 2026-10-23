@@ -19,6 +19,26 @@ recorded here with the reason.
 ## [Unreleased]
 
 ### Added
+- `pc-grpc` DNS discovery for headless Services (**next release: minor,
+  1.6.0** - additive API; not bumped here). `GrpcClientFactory::connect_discovered`
+  / `connect_discovered_lazy` resolve the target host to its A records (IPv4
+  preferred), keep `pool` balanced connections per address and re-resolve on an
+  interval, inserting new pods and removing gone ones. An empty or failed lookup
+  changes nothing, removals never empty the balancer, the refresher never waits
+  on the balancer's change queue, and its task ends with the `Channel`. Under
+  TLS the Service name stays the SNI domain, and the HTTP/2 `:authority` stays
+  the Service host:port. `connect` and `connect_lazy` switch to it when
+  `GRPC_DNS_REFRESH_SEC` is a positive number of seconds; unset or `0` is
+  exactly the previous behaviour. `GrpcClientFactory::with_dns_refresh` and
+  `discovery_refresh` read/override the interval (the explicit `refresh`
+  argument of `connect_discovered*` always wins). The lazy variant starts with
+  the plain host-name pool and swaps to resolved addresses after the first
+  successful lookup (retried at 1s, 2s, 4s... up to the interval), so a call
+  can never wait on an empty balancer. Before, every subchannel resolved the
+  headless name once at connect time and stayed on that pod, so a pod added
+  later (a scale-up) received no traffic from an already-running caller. No
+  existing public item changed: the interval lives on the factory, not on
+  `GrpcConfig`, so downstream `GrpcConfig { .. }` literals keep compiling.
 - `pc-amqp::AmqpClient::publish_to` (arbitrary routing key + caller properties)
   and `AmqpClient::reply` (answer a delivery on its own `reply_to` queue,
   inheriting the requester's correlation ID). The queue-bound publishers could
