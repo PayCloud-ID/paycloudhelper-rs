@@ -272,6 +272,14 @@ impl Refresher {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs::File;
+    use std::net::TcpListener;
+    use std::process::{Child, Command, Stdio};
+    use std::time::Instant;
+    use tonic_health::pb::health_client::HealthClient;
+    use tonic_health::pb::HealthCheckRequest;
+
+    static ENV_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
     fn set(addrs: &[&str]) -> BTreeSet<SocketAddr> {
         addrs.iter().map(|a| a.parse().unwrap()).collect()
@@ -543,5 +551,267 @@ mod tests {
         // IPv6-only is left alone rather than emptied.
         let v6 = set(&["[fd00::1]:9106"]);
         assert_eq!(prefer_ipv4(v6.clone()), v6);
+    }
+
+    /// Real grpc-go server fixture. Opt in with
+    /// `PC_GRPC_GOAWAY_TEST=1 cargo test -p pc-grpc goaway_recovers -- --ignored --nocapture`.
+    ///
+    /// Proves recovery after a real grpc-go idle close with two stable DNS
+    /// addresses, at pool sizes 1 and 2, through both eager and lazy constructors.
+    /// Only MaxConnectionIdle is shortened to 300 ms for a practical local run.
+    #[tokio::test]
+    #[ignore = "requires Go and PC_GRPC_GOAWAY_TEST=1; runs the real grpc-go idle-GOAWAY fixture"]
+    async fn goaway_recovers_with_stable_addresses_at_pool_one_and_two() {
+        assert_eq!(
+            std::env::var("PC_GRPC_GOAWAY_TEST").as_deref(),
+            Ok("1"),
+            "set PC_GRPC_GOAWAY_TEST=1 to run the grpc-go fixture"
+        );
+        let _env_lock = ENV_LOCK.lock().await;
+        let mut fixture = GoAwayFixture::start();
+        let addrs = fixture.addrs.clone();
+        println!("fake resolver DNS answers={addrs:?} (stable for the full run)");
+        let resolver = FakeResolver::new(vec![Ok(addrs.clone())]);
+        let started = Instant::now();
+
+        for construction in ["eager", "lazy"] {
+            for pool in [1, 2] {
+                let _target = EnvVar::set(
+                    "TRANSACTION_GRPC",
+                    format!("pa498.test:{}", addrs[0].port()),
+                );
+                let _pool = EnvVar::set("GRPC_TRANSACTION_MAX_POOL", pool.to_string());
+                let _tls = EnvVar::set("GRPC_TLS_MODE", "insecure");
+                let _keepalive_time = EnvVar::set("GRPC_KEEP_ALIVE_TIME", "30");
+                let _keepalive_timeout = EnvVar::set("GRPC_KEEP_ALIVE_TIMEOUT", "10");
+                let _permit = EnvVar::set("GRPC_PERMIT_WITHOUT_STREAM", "true");
+                let _retries = EnvVar::set("GRPC_MAX_RETRIES", "3");
+                let _initial_backoff = EnvVar::set("GRPC_INITIAL_BACKOFF", "100");
+                let _max_backoff = EnvVar::set("GRPC_MAX_BACKOFF", "30");
+                let _backoff_multiplier = EnvVar::set("GRPC_BACKOFF_MULTIPLIER", "2");
+                let _max_idle = EnvVar::set("GRPC_MAX_IDLE", "30");
+                let _max_life = EnvVar::set("GRPC_MAX_LIFE", "24");
+                let factory = crate::GrpcClientFactory::from_env().unwrap();
+                let channel = match construction {
+                    "eager" => factory
+                        .connect_discovered_with(
+                            "TRANSACTION_GRPC",
+                            Duration::from_secs(30),
+                            resolver.clone(),
+                        )
+                        .await
+                        .expect("connect discovered to both grpc-go fixture addresses"),
+                    "lazy" => factory
+                        .connect_discovered_lazy_with(
+                            "TRANSACTION_GRPC",
+                            Duration::from_secs(30),
+                            resolver.clone(),
+                        )
+                        .expect("construct lazy discovered channel"),
+                    _ => unreachable!(),
+                };
+                tokio::time::sleep(Duration::from_millis(100)).await;
+
+                assert_channel_recovers(&channel, construction, pool, started).await;
+                drop(channel);
+            }
+        }
+
+        fixture.stop_and_report();
+    }
+
+    async fn assert_channel_recovers(
+        channel: &tonic::transport::Channel,
+        construction: &str,
+        pool: usize,
+        started: Instant,
+    ) {
+        let mut consecutive_failures = 0;
+        let mut total_successes = 0;
+        for probe in 1..=5 {
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            let request = HealthCheckRequest {
+                service: String::new(),
+            };
+            let result = tokio::time::timeout(
+                Duration::from_millis(950),
+                HealthClient::new(channel.clone()).check(request),
+            )
+            .await
+            .expect("health RPC must stay within the production deadline");
+            match result {
+                Ok(_) => {
+                    consecutive_failures = 0;
+                    total_successes += 1;
+                    println!(
+                        "elapsed_ms={} construction={construction} pool={pool} probe={probe} result=ok",
+                        started.elapsed().as_millis()
+                    );
+                }
+                Err(status) => {
+                    let message = status.message().to_ascii_lowercase();
+                    assert!(
+                        matches!(
+                            status.code(),
+                            tonic::Code::Cancelled
+                                | tonic::Code::Unknown
+                                | tonic::Code::Unavailable
+                        ),
+                        "pool={pool} probe={probe} got non-transport status: {status}"
+                    );
+                    println!(
+                        "elapsed_ms={} construction={construction} pool={pool} probe={probe} result=error code={:?} message={:?}",
+                        started.elapsed().as_millis(),
+                        status.code(),
+                        status.message()
+                    );
+                    consecutive_failures += 1;
+                    assert!(
+                        consecutive_failures < 2,
+                        "construction={construction} pool={pool} remained failed across probes after grpc-go MaxConnectionIdle GOAWAY: {status}"
+                    );
+                    if matches!(status.code(), tonic::Code::Cancelled | tonic::Code::Unknown) {
+                        assert!(
+                            message.contains("operation was canceled")
+                                || message.contains("transport error")
+                                || message.contains("connection closed"),
+                            "construction={construction} pool={pool} error was not the observed idle-close transport failure: {status}"
+                        );
+                    }
+                }
+            }
+        }
+        assert!(
+            total_successes > 0,
+            "construction={construction} pool={pool} had no successful probes"
+        );
+        assert_eq!(
+            consecutive_failures, 0,
+            "construction={construction} pool={pool} ended without recovering after its last failed probe"
+        );
+    }
+
+    struct EnvVar {
+        key: &'static str,
+        previous: Option<std::ffi::OsString>,
+    }
+
+    impl EnvVar {
+        fn set(key: &'static str, value: impl AsRef<std::ffi::OsStr>) -> Self {
+            let previous = std::env::var_os(key);
+            std::env::set_var(key, value);
+            Self { key, previous }
+        }
+    }
+
+    impl Drop for EnvVar {
+        fn drop(&mut self) {
+            if let Some(value) = &self.previous {
+                std::env::set_var(self.key, value);
+            } else {
+                std::env::remove_var(self.key);
+            }
+        }
+    }
+
+    struct GoAwayFixture {
+        child: Option<Child>,
+        addrs: Vec<SocketAddr>,
+        log_path: std::path::PathBuf,
+    }
+
+    impl GoAwayFixture {
+        fn start() -> Self {
+            let addrs: Vec<_> = (0..2)
+                .map(|_| {
+                    let listener = TcpListener::bind("127.0.0.1:0").expect("reserve fixture port");
+                    listener.local_addr().unwrap()
+                })
+                .collect();
+            let log_path = std::env::temp_dir().join(format!(
+                "pc-grpc-goaway-{}-{}.log",
+                std::process::id(),
+                Instant::now().elapsed().as_nanos()
+            ));
+            let log = File::create(&log_path).expect("create sanitized fixture log");
+            let stderr = log.try_clone().expect("clone fixture log handle");
+            let child = Command::new("go")
+                .args([
+                    "run",
+                    ".",
+                    "-addr-one",
+                    &addrs[0].to_string(),
+                    "-addr-two",
+                    &addrs[1].to_string(),
+                    "-idle",
+                    "300ms",
+                ])
+                .current_dir(concat!(
+                    env!("CARGO_MANIFEST_DIR"),
+                    "/tests/fixtures/goaway"
+                ))
+                .stdout(Stdio::from(log))
+                .stderr(Stdio::from(stderr))
+                .spawn()
+                .expect("start grpc-go fixture; install Go and download its pinned module first");
+            let fixture = Self {
+                child: Some(child),
+                addrs,
+                log_path,
+            };
+
+            for addr in &fixture.addrs {
+                let deadline = Instant::now() + Duration::from_secs(30);
+                loop {
+                    if std::net::TcpStream::connect(addr).is_ok() {
+                        break;
+                    }
+                    assert!(
+                        Instant::now() < deadline,
+                        "grpc-go fixture did not listen on {addr}"
+                    );
+                    std::thread::sleep(Duration::from_millis(50));
+                }
+            }
+            println!(
+                "grpc-go fixture addresses={:?} max_connection_idle_ms=300",
+                fixture.addrs
+            );
+            fixture
+        }
+
+        fn stop_and_report(&mut self) {
+            if let Some(mut child) = self.child.take() {
+                let _ = child.kill();
+                let _ = child.wait();
+            }
+            let logs = std::fs::read_to_string(&self.log_path).unwrap_or_default();
+            println!("grpc-go connection lifecycle:\n{logs}");
+            for addr in &self.addrs {
+                let prefix = addr.to_string();
+                assert!(
+                    logs.lines()
+                        .any(|line| { line.contains(&prefix) && line.contains("connection_open") }),
+                    "fixture address {addr} received no gRPC connection"
+                );
+                assert!(
+                    logs.lines().any(|line| {
+                        line.contains(&prefix) && line.contains("connection_close")
+                    }),
+                    "fixture address {addr} recorded no gRPC connection close"
+                );
+            }
+            let _ = std::fs::remove_file(&self.log_path);
+        }
+    }
+
+    impl Drop for GoAwayFixture {
+        fn drop(&mut self) {
+            if let Some(mut child) = self.child.take() {
+                let _ = child.kill();
+                let _ = child.wait();
+            }
+            let _ = std::fs::remove_file(&self.log_path);
+        }
     }
 }
