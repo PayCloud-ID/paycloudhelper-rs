@@ -67,6 +67,45 @@ recorded here with the reason.
   **Not fixed here:** aligning it changes behaviour for a consumer already
   pinned to `v1.0.2`, so the call is the helper owner's.
 
+## [1.7.0] - 2026-11-05
+
+### Added
+- `pc-grpc::PooledChannel`, `GrpcClientFactory::connect_pooled` and
+  `connect_pooled_lazy` (PA-513, child of PA-498; additive API). The `Channel`
+  every `connect*` method returns is a tower p2c balancer over tonic
+  `Reconnect` services, and a service re-dials only while a request polls it.
+  When another service is ready, p2c serves the request from it and the re-dial
+  is left unpolled: TCP completes, the HTTP/2 preface is never written, a server
+  with a short `ConnectionTimeout` (transaction-module 10 s; grpc-go default
+  120 s) closes the orphan, and the next probe that lands on it is dropped
+  unsent with `hyper::Error(Canceled, "connection closed")`. In production
+  that failed 36.4% of qoinhub's transaction probes. `PooledChannel` owns one
+  single-service `Channel` per address slot (`pool` per resolved address, or
+  `pool` on the plain host name without discovery), picked round-robin. A
+  request that finds its connection dead waits for its own re-dial, so the
+  failure no longer depends on the server's timer. A transport failure sidelines
+  that address (all its slots) for 5 s, so a pod that went away costs one
+  failed call; a fully penalised pool still serves rather than refusing.
+  Discovery reuses the existing refresher; a driver task drains its change
+  queue continuously, so pods are added and removed without traffic.
+  `PooledChannel` implements `tower::Service<http::Request<tonic::body::Body>>`,
+  so every tonic-generated client accepts it; migrating is a type swap.
+  Same env gating, prewarm and no-boot-failure contracts, and `GRPC_*` options
+  as `connect` / `connect_lazy`. `tower` moves from a dev-dependency to a
+  dependency of `pc-grpc`. No Go counterpart (grpc-go's balancer does not have
+  this starvation).
+
+### Known divergences
+- `connect`, `connect_lazy`, `connect_discovered` and `connect_discovered_lazy`
+  are unchanged and keep the PA-498 starvation. Changing their return type
+  would break every consumer pinned to `v1.6.0`; consumers migrate to
+  `connect_pooled*` instead. `#[ignore]`d test
+  `stock_discovery_channel_fails_probes_against_a_short_connection_timeout`
+  characterises it (7, 24 and 27 of 30 probes failed in three local runs).
+- `PooledChannel` balances round-robin over healthy slots, not by p2c load.
+  Fine for the low-rate unary calls of its first consumer (qoinhub); revisit if
+  a high-rate consumer adopts it.
+
 ## [1.6.0] - 2026-10-23
 
 ### Added

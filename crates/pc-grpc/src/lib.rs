@@ -35,6 +35,24 @@
 //! See [`GrpcClientFactory::connect_discovered`] and
 //! [`GrpcClientFactory::connect_discovered_lazy`] for the contracts.
 //!
+//! # Driven reconnects (`PooledChannel`)
+//!
+//! The `Channel` that every `connect*` method returns is a tower p2c balancer
+//! over tonic `Reconnect` services, and a service re-dials only while a request
+//! polls it. When another service is ready, the request is served there and
+//! the re-dial is left unpolled: TCP completes, the HTTP/2 preface is never
+//! written, a server with a short `ConnectionTimeout` closes the orphan, and
+//! the next request that lands on it fails with `Canceled "connection closed"`
+//! (PA-498). [`GrpcClientFactory::connect_pooled`] and
+//! [`GrpcClientFactory::connect_pooled_lazy`] return a [`PooledChannel`]
+//! instead: one single-service channel per address slot, picked round-robin,
+//! with a short penalty for an address whose call just failed. A request that
+//! finds its connection dead waits on its own re-dial, so it never lands on a
+//! half-open connection whatever the server's timeout. Same env gating, same
+//! prewarm contracts, same `GRPC_*` options; discovery changes are applied by a
+//! driver task without needing traffic. Every tonic-generated client accepts
+//! it (`HealthClient::new(pooled)`).
+//!
 //! It also provides the RC-1 shrinking-budget deadline helpers
 //! ([`child_budget`]/[`with_deadline`]): a child call's deadline is strictly
 //! less than the wall budget so it always expires first.
@@ -45,6 +63,9 @@
 //! `#[ignore]`d.
 
 mod discovery;
+mod pooled;
+#[cfg(test)]
+mod testkit;
 
 use std::collections::BTreeSet;
 use std::net::SocketAddr;
@@ -57,6 +78,8 @@ use tonic::transport::channel::Change;
 use tonic::transport::{Certificate, Channel, ClientTlsConfig, Endpoint};
 
 use crate::discovery::{EndpointKey, Refresher, Resolver, SystemResolver};
+
+pub use crate::pooled::{PoolError, PooledChannel};
 
 /// Default connections-per-target for every pool.
 ///
@@ -314,6 +337,9 @@ impl GrpcClientFactory {
     /// mirrors: `GrpcClientPool.GetConnection` + `createConnection` (round-robin
     /// pool, retry-with-backoff establishment) over the target that
     /// `GrpcManager.initializeConnections` dials.
+    ///
+    /// Returns a tower-balanced `Channel` whose re-dials are polled only by
+    /// requests; prefer `connect_pooled*` (see PA-498 and the crate docs).
     pub async fn connect(&self, target_env: &str) -> Result<Channel> {
         if let Some(refresh) = self.discovery_refresh() {
             return self.connect_discovered(target_env, refresh).await;
@@ -357,6 +383,9 @@ impl GrpcClientFactory {
     /// With `GRPC_DNS_REFRESH_SEC` > 0 this is
     /// [`GrpcClientFactory::connect_discovered_lazy`]: still synchronous and
     /// still no DNS at construction (the first lookup happens in the background).
+    ///
+    /// Returns a tower-balanced `Channel` whose re-dials are polled only by
+    /// requests; prefer `connect_pooled*` (see PA-498 and the crate docs).
     pub fn connect_lazy(&self, target_env: &str) -> Result<Channel> {
         if let Some(refresh) = self.discovery_refresh() {
             return self.connect_discovered_lazy(target_env, refresh);
@@ -390,6 +419,9 @@ impl GrpcClientFactory {
     ///
     /// The refresher is a spawned Tokio task that ends when the returned
     /// `Channel` (and every clone) is dropped. `refresh` must be non-zero.
+    ///
+    /// Returns a tower-balanced `Channel` whose re-dials are polled only by
+    /// requests; prefer `connect_pooled*` (see PA-498 and the crate docs).
     pub async fn connect_discovered(&self, target_env: &str, refresh: Duration) -> Result<Channel> {
         self.connect_discovered_with(target_env, refresh, Arc::new(SystemResolver))
             .await
@@ -408,6 +440,9 @@ impl GrpcClientFactory {
     /// `refresh`) until it succeeds, and on that first success the per-address
     /// endpoints are inserted and the host-name seed is removed. Must be called
     /// inside a Tokio runtime, like `connect_lazy`.
+    ///
+    /// Returns a tower-balanced `Channel` whose re-dials are polled only by
+    /// requests; prefer `connect_pooled*` (see PA-498 and the crate docs).
     pub fn connect_discovered_lazy(&self, target_env: &str, refresh: Duration) -> Result<Channel> {
         self.connect_discovered_lazy_with(target_env, refresh, Arc::new(SystemResolver))
     }
@@ -503,6 +538,134 @@ impl GrpcClientFactory {
             .run(true, build),
         );
         Ok(channel)
+    }
+
+    /// Connect to `target_env` like [`GrpcClientFactory::connect`], but return a
+    /// [`PooledChannel`]: one single-service channel per address slot, each of
+    /// which drives its own reconnect (PA-498). Same env gating, same prewarm
+    /// fail-fast contract, same `GRPC_*` endpoint options.
+    ///
+    /// With `GRPC_DNS_REFRESH_SEC` > 0 the slots are `pool` per resolved address
+    /// and follow the Service's A records, as for
+    /// [`GrpcClientFactory::connect_discovered`]; otherwise they are `pool`
+    /// slots on the plain host name. The discovery driver and its refresher end
+    /// when the last clone of the returned channel is dropped.
+    ///
+    /// mirrors: `GrpcClientPool.GetConnection` + `createConnection`, as
+    /// [`GrpcClientFactory::connect`] does; only the client-side balancing differs.
+    pub async fn connect_pooled(&self, target_env: &str) -> Result<PooledChannel> {
+        if let Some(refresh) = self.discovery_refresh() {
+            return self
+                .connect_pooled_with(target_env, refresh, Arc::new(SystemResolver))
+                .await;
+        }
+        let (target, pool) = self.resolve_target(target_env)?;
+        let endpoint = self.build_endpoint(&target, None)?;
+
+        tracing::info!(target = %target, pool, "pc-grpc: prewarming pooled channel");
+        self.prewarm(&endpoint).await?;
+
+        Ok(static_pool(&endpoint, pool))
+    }
+
+    /// The no-boot-failure counterpart of [`GrpcClientFactory::connect_pooled`],
+    /// with the contract of [`GrpcClientFactory::connect_lazy`]: no prewarm,
+    /// synchronous, no DNS at construction, and it must be called inside a
+    /// Tokio runtime.
+    ///
+    /// With discovery on, the pool starts with `pool` plain host-name slots
+    /// (exactly as [`GrpcClientFactory::connect_discovered_lazy`] seeds its
+    /// balancer); the first lookup runs at once in the background and, on its
+    /// first success, the per-address slots are inserted and the seed removed.
+    pub fn connect_pooled_lazy(&self, target_env: &str) -> Result<PooledChannel> {
+        if let Some(refresh) = self.discovery_refresh() {
+            return self.connect_pooled_lazy_with(target_env, refresh, Arc::new(SystemResolver));
+        }
+        let (target, pool) = self.resolve_target(target_env)?;
+        let endpoint = self.build_endpoint(&target, None)?;
+
+        tracing::info!(target = %target, pool, "pc-grpc: lazy pooled channel (no prewarm)");
+        Ok(static_pool(&endpoint, pool))
+    }
+
+    pub(crate) async fn connect_pooled_with(
+        &self,
+        target_env: &str,
+        refresh: Duration,
+        resolver: Arc<dyn Resolver>,
+    ) -> Result<PooledChannel> {
+        let (host, port, pool) = self.discovery_target(target_env, refresh)?;
+        let initial = self.initial_lookup(resolver.as_ref(), &host, port).await?;
+
+        let build = self.discovery_builder(&host, port);
+        let first = *initial.iter().next().expect("initial_lookup is non-empty");
+        self.prewarm(&build(first)?).await?;
+
+        tracing::info!(
+            host = %host, port, pool, addrs = initial.len(),
+            refresh_secs = refresh.as_secs(),
+            "pc-grpc: discovery-aware pooled channel"
+        );
+
+        let mut slots = Vec::with_capacity(initial.len() * pool);
+        for addr in &initial {
+            let endpoint = build(*addr)?;
+            slots.extend((0..pool).map(|slot| (EndpointKey::Addr(*addr, slot), endpoint.clone())));
+        }
+        let (tx, rx) = tokio::sync::mpsc::channel(DISCOVERY_BUFFER);
+        let pooled = PooledChannel::spawn(slots, rx);
+        tokio::spawn(
+            Refresher {
+                resolver,
+                host,
+                port,
+                refresh,
+                pool,
+                seed_slots: 0,
+                known: initial,
+                tx,
+            }
+            .run(false, build),
+        );
+        Ok(pooled)
+    }
+
+    pub(crate) fn connect_pooled_lazy_with(
+        &self,
+        target_env: &str,
+        refresh: Duration,
+        resolver: Arc<dyn Resolver>,
+    ) -> Result<PooledChannel> {
+        let (host, port, pool) = self.discovery_target(target_env, refresh)?;
+        tracing::info!(
+            host = %host, port, pool, refresh_secs = refresh.as_secs(),
+            "pc-grpc: lazy discovery-aware pooled channel (no prewarm)"
+        );
+
+        // Seeded with the plain host-name pool so it is never empty; the
+        // refresher drops the seed after its first real insert.
+        let seed = self.build_endpoint(&dial_target(&host, port), None)?;
+        let slots = (0..pool)
+            .map(|slot| (EndpointKey::Seed(slot), seed.clone()))
+            .collect();
+        let (tx, rx) = tokio::sync::mpsc::channel(DISCOVERY_BUFFER);
+        let pooled = PooledChannel::spawn(slots, rx);
+
+        let build = self.discovery_builder(&host, port);
+        tokio::spawn(
+            Refresher {
+                resolver,
+                host,
+                port,
+                refresh,
+                pool,
+                seed_slots: pool,
+                known: BTreeSet::new(),
+                tx,
+            }
+            .run(true, build),
+        );
+        Ok(pooled)
     }
 
     /// `(host, port, pool)` for a discovery connect; rejects a zero `refresh`.
@@ -678,6 +841,16 @@ impl GrpcClientFactory {
     }
 }
 
+/// `pool` slots on one non-discovery endpoint. The change queue's sender is
+/// dropped here, so the driver ends at once and the slots stay as built.
+fn static_pool(endpoint: &Endpoint, pool: usize) -> PooledChannel {
+    let (_tx, rx) = tokio::sync::mpsc::channel(1);
+    let slots = (0..pool)
+        .map(|slot| (EndpointKey::Seed(slot), endpoint.clone()))
+        .collect();
+    PooledChannel::spawn(slots, rx)
+}
+
 /// `initial × attempt²`, clamped to `max` (pure — testable without a pool).
 ///
 /// Split out because the linear-vs-quadratic bug lived here undetected: there
@@ -792,10 +965,7 @@ fn env_bool(key: &str, default: bool) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Mutex;
-
-    // Serialises tests that mutate process-global environment variables.
-    static ENV_LOCK: Mutex<()> = Mutex::new(());
+    use crate::testkit::ENV_LOCK;
 
     /// Go: `time.Duration(attempt*attempt*100) * time.Millisecond`
     /// (`app/grpc_pool.go:562`). At the default 100ms base a 3-attempt prewarm
