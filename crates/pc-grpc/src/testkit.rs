@@ -177,4 +177,114 @@ mod tests {
             "expected the starvation to show; tune HANDSHAKE/LIFETIME/GAP until it does"
         );
     }
+
+    async fn pooled_over(resolver: Arc<dyn Resolver>, refresh: Duration) -> crate::PooledChannel {
+        let _guard = ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        std::env::set_var("TRANSACTION_GRPC", "svc-headless:9106");
+        let factory = GrpcClientFactory::from_env().unwrap();
+        let pooled = factory
+            .connect_pooled_with("TRANSACTION_GRPC", refresh, resolver)
+            .await
+            .unwrap();
+        std::env::remove_var("TRANSACTION_GRPC");
+        pooled
+    }
+
+    /// The regression for the characterization above: same fixture, same
+    /// timers, 2 addresses x pool 2. Deterministic, because each slot's request
+    /// waits on its own re-dial instead of skipping it.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn pooled_channel_never_fails_a_probe_against_a_short_connection_timeout() {
+        let (a, b) = two_backends().await;
+        let pooled = pooled_over(fixed(&[&a, &b]), Duration::from_secs(30)).await;
+        assert_eq!(pooled.slot_count(), 4);
+
+        for round in 0..ROUNDS {
+            tokio::time::sleep(GAP).await;
+            HealthClient::new(pooled.clone())
+                .check(health_request())
+                .await
+                .unwrap_or_else(|e| panic!("probe {round} failed: {e:?}"));
+        }
+        // Every tick found its connection closed by the fixture, so the probes
+        // above went over fresh connections each time; the fixture saw them.
+        let accepted = a.accepted.load(Ordering::SeqCst) + b.accepted.load(Ordering::SeqCst);
+        assert!(
+            accepted >= ROUNDS,
+            "only {accepted} connections for {ROUNDS} probes"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_pod_that_goes_away_costs_at_most_one_failed_call() {
+        let (a, mut b) = two_backends().await;
+        let pooled = pooled_over(fixed(&[&a, &b]), Duration::from_secs(30)).await;
+        HealthClient::new(pooled.clone())
+            .check(health_request())
+            .await
+            .expect("both pods up");
+
+        b.stop();
+        // Let every bridged connection to b reach its end of life.
+        tokio::time::sleep(LIFETIME + Duration::from_millis(100)).await;
+
+        let mut failed = 0;
+        for _ in 0..10 {
+            if HealthClient::new(pooled.clone())
+                .check(health_request())
+                .await
+                .is_err()
+            {
+                failed += 1;
+            }
+        }
+        assert!(failed <= 1, "{failed}/10 calls failed after b went away");
+    }
+
+    /// Answers `answers[stage]`; the test moves `stage`.
+    struct Staged {
+        answers: Vec<BTreeSet<SocketAddr>>,
+        stage: AtomicUsize,
+    }
+
+    impl Resolver for Staged {
+        fn lookup<'a>(&'a self, _h: &'a str, _p: u16) -> LookupFuture<'a> {
+            let a = self.answers[self.stage.load(Ordering::SeqCst)].clone();
+            Box::pin(async move { Ok(a) })
+        }
+    }
+
+    async fn wait_for_slots(pooled: &crate::PooledChannel, want: usize) {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while pooled.slot_count() != want {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("slot count stayed {} (want {want})", pooled.slot_count()));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn discovery_adds_and_removes_slots_without_any_request() {
+        let (a, b) = two_backends().await;
+        let resolver = Arc::new(Staged {
+            answers: vec![
+                [a.addr].into_iter().collect(),
+                [a.addr, b.addr].into_iter().collect(),
+                [b.addr].into_iter().collect(),
+            ],
+            stage: AtomicUsize::new(0),
+        });
+        let pooled = pooled_over(resolver.clone(), Duration::from_millis(200)).await;
+        assert_eq!(pooled.slot_count(), 2);
+
+        // No call is made from here on. The balancer-based channel could not do
+        // this: it drains its change queue only while a request polls it.
+        resolver.stage.store(1, Ordering::SeqCst);
+        wait_for_slots(&pooled, 4).await;
+        resolver.stage.store(2, Ordering::SeqCst);
+        wait_for_slots(&pooled, 2).await;
+    }
 }

@@ -45,6 +45,7 @@
 //! `#[ignore]`d.
 
 mod discovery;
+mod pooled;
 #[cfg(test)]
 mod testkit;
 
@@ -59,6 +60,8 @@ use tonic::transport::channel::Change;
 use tonic::transport::{Certificate, Channel, ClientTlsConfig, Endpoint};
 
 use crate::discovery::{EndpointKey, Refresher, Resolver, SystemResolver};
+
+pub use crate::pooled::{PoolError, PooledChannel};
 
 /// Default connections-per-target for every pool.
 ///
@@ -507,6 +510,134 @@ impl GrpcClientFactory {
         Ok(channel)
     }
 
+    /// Connect to `target_env` like [`GrpcClientFactory::connect`], but return a
+    /// [`PooledChannel`]: one single-service channel per address slot, each of
+    /// which drives its own reconnect (PA-498). Same env gating, same prewarm
+    /// fail-fast contract, same `GRPC_*` endpoint options.
+    ///
+    /// With `GRPC_DNS_REFRESH_SEC` > 0 the slots are `pool` per resolved address
+    /// and follow the Service's A records, as for
+    /// [`GrpcClientFactory::connect_discovered`]; otherwise they are `pool`
+    /// slots on the plain host name. The discovery driver and its refresher end
+    /// when the last clone of the returned channel is dropped.
+    ///
+    /// mirrors: `GrpcClientPool.GetConnection` + `createConnection`, as
+    /// [`GrpcClientFactory::connect`] does; only the client-side balancing differs.
+    pub async fn connect_pooled(&self, target_env: &str) -> Result<PooledChannel> {
+        if let Some(refresh) = self.discovery_refresh() {
+            return self
+                .connect_pooled_with(target_env, refresh, Arc::new(SystemResolver))
+                .await;
+        }
+        let (target, pool) = self.resolve_target(target_env)?;
+        let endpoint = self.build_endpoint(&target, None)?;
+
+        tracing::info!(target = %target, pool, "pc-grpc: prewarming pooled channel");
+        self.prewarm(&endpoint).await?;
+
+        Ok(static_pool(&endpoint, pool))
+    }
+
+    /// The no-boot-failure counterpart of [`GrpcClientFactory::connect_pooled`],
+    /// with the contract of [`GrpcClientFactory::connect_lazy`]: no prewarm,
+    /// synchronous, no DNS at construction, and it must be called inside a
+    /// Tokio runtime.
+    ///
+    /// With discovery on, the pool starts with `pool` plain host-name slots
+    /// (exactly as [`GrpcClientFactory::connect_discovered_lazy`] seeds its
+    /// balancer); the first lookup runs at once in the background and, on its
+    /// first success, the per-address slots are inserted and the seed removed.
+    pub fn connect_pooled_lazy(&self, target_env: &str) -> Result<PooledChannel> {
+        if let Some(refresh) = self.discovery_refresh() {
+            return self.connect_pooled_lazy_with(target_env, refresh, Arc::new(SystemResolver));
+        }
+        let (target, pool) = self.resolve_target(target_env)?;
+        let endpoint = self.build_endpoint(&target, None)?;
+
+        tracing::info!(target = %target, pool, "pc-grpc: lazy pooled channel (no prewarm)");
+        Ok(static_pool(&endpoint, pool))
+    }
+
+    pub(crate) async fn connect_pooled_with(
+        &self,
+        target_env: &str,
+        refresh: Duration,
+        resolver: Arc<dyn Resolver>,
+    ) -> Result<PooledChannel> {
+        let (host, port, pool) = self.discovery_target(target_env, refresh)?;
+        let initial = self.initial_lookup(resolver.as_ref(), &host, port).await?;
+
+        let build = self.discovery_builder(&host, port);
+        let first = *initial.iter().next().expect("initial_lookup is non-empty");
+        self.prewarm(&build(first)?).await?;
+
+        tracing::info!(
+            host = %host, port, pool, addrs = initial.len(),
+            refresh_secs = refresh.as_secs(),
+            "pc-grpc: discovery-aware pooled channel"
+        );
+
+        let mut slots = Vec::with_capacity(initial.len() * pool);
+        for addr in &initial {
+            let endpoint = build(*addr)?;
+            slots.extend((0..pool).map(|slot| (EndpointKey::Addr(*addr, slot), endpoint.clone())));
+        }
+        let (tx, rx) = tokio::sync::mpsc::channel(DISCOVERY_BUFFER);
+        let pooled = PooledChannel::spawn(slots, rx);
+        tokio::spawn(
+            Refresher {
+                resolver,
+                host,
+                port,
+                refresh,
+                pool,
+                seed_slots: 0,
+                known: initial,
+                tx,
+            }
+            .run(false, build),
+        );
+        Ok(pooled)
+    }
+
+    pub(crate) fn connect_pooled_lazy_with(
+        &self,
+        target_env: &str,
+        refresh: Duration,
+        resolver: Arc<dyn Resolver>,
+    ) -> Result<PooledChannel> {
+        let (host, port, pool) = self.discovery_target(target_env, refresh)?;
+        tracing::info!(
+            host = %host, port, pool, refresh_secs = refresh.as_secs(),
+            "pc-grpc: lazy discovery-aware pooled channel (no prewarm)"
+        );
+
+        // Seeded with the plain host-name pool so it is never empty; the
+        // refresher drops the seed after its first real insert.
+        let seed = self.build_endpoint(&dial_target(&host, port), None)?;
+        let slots = (0..pool)
+            .map(|slot| (EndpointKey::Seed(slot), seed.clone()))
+            .collect();
+        let (tx, rx) = tokio::sync::mpsc::channel(DISCOVERY_BUFFER);
+        let pooled = PooledChannel::spawn(slots, rx);
+
+        let build = self.discovery_builder(&host, port);
+        tokio::spawn(
+            Refresher {
+                resolver,
+                host,
+                port,
+                refresh,
+                pool,
+                seed_slots: pool,
+                known: BTreeSet::new(),
+                tx,
+            }
+            .run(true, build),
+        );
+        Ok(pooled)
+    }
+
     /// `(host, port, pool)` for a discovery connect; rejects a zero `refresh`.
     fn discovery_target(
         &self,
@@ -678,6 +809,16 @@ impl GrpcClientFactory {
             attempt,
         )
     }
+}
+
+/// `pool` slots on one non-discovery endpoint. The change queue's sender is
+/// dropped here, so the driver ends at once and the slots stay as built.
+fn static_pool(endpoint: &Endpoint, pool: usize) -> PooledChannel {
+    let (_tx, rx) = tokio::sync::mpsc::channel(1);
+    let slots = (0..pool)
+        .map(|slot| (EndpointKey::Seed(slot), endpoint.clone()))
+        .collect();
+    PooledChannel::spawn(slots, rx)
 }
 
 /// `initial × attempt²`, clamped to `max` (pure — testable without a pool).
