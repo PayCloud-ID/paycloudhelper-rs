@@ -35,6 +35,24 @@
 //! See [`GrpcClientFactory::connect_discovered`] and
 //! [`GrpcClientFactory::connect_discovered_lazy`] for the contracts.
 //!
+//! # Driven reconnects (`PooledChannel`)
+//!
+//! The `Channel` that every `connect*` method returns is a tower p2c balancer
+//! over tonic `Reconnect` services, and a service re-dials only while a request
+//! polls it. When another service is ready, the request is served there and
+//! the re-dial is left unpolled: TCP completes, the HTTP/2 preface is never
+//! written, a server with a short `ConnectionTimeout` closes the orphan, and
+//! the next request that lands on it fails with `Canceled "connection closed"`
+//! (PA-498). [`GrpcClientFactory::connect_pooled`] and
+//! [`GrpcClientFactory::connect_pooled_lazy`] return a [`PooledChannel`]
+//! instead: one single-service channel per address slot, picked round-robin,
+//! with a short penalty for an address whose call just failed. A request that
+//! finds its connection dead waits on its own re-dial, so it never lands on a
+//! half-open connection whatever the server's timeout. Same env gating, same
+//! prewarm contracts, same `GRPC_*` options; discovery changes are applied by a
+//! driver task without needing traffic. Every tonic-generated client accepts
+//! it (`HealthClient::new(pooled)`).
+//!
 //! It also provides the RC-1 shrinking-budget deadline helpers
 //! ([`child_budget`]/[`with_deadline`]): a child call's deadline is strictly
 //! less than the wall budget so it always expires first.
@@ -319,6 +337,9 @@ impl GrpcClientFactory {
     /// mirrors: `GrpcClientPool.GetConnection` + `createConnection` (round-robin
     /// pool, retry-with-backoff establishment) over the target that
     /// `GrpcManager.initializeConnections` dials.
+    ///
+    /// Returns a tower-balanced `Channel` whose re-dials are polled only by
+    /// requests; prefer `connect_pooled*` (see PA-498 and the crate docs).
     pub async fn connect(&self, target_env: &str) -> Result<Channel> {
         if let Some(refresh) = self.discovery_refresh() {
             return self.connect_discovered(target_env, refresh).await;
@@ -362,6 +383,9 @@ impl GrpcClientFactory {
     /// With `GRPC_DNS_REFRESH_SEC` > 0 this is
     /// [`GrpcClientFactory::connect_discovered_lazy`]: still synchronous and
     /// still no DNS at construction (the first lookup happens in the background).
+    ///
+    /// Returns a tower-balanced `Channel` whose re-dials are polled only by
+    /// requests; prefer `connect_pooled*` (see PA-498 and the crate docs).
     pub fn connect_lazy(&self, target_env: &str) -> Result<Channel> {
         if let Some(refresh) = self.discovery_refresh() {
             return self.connect_discovered_lazy(target_env, refresh);
@@ -395,6 +419,9 @@ impl GrpcClientFactory {
     ///
     /// The refresher is a spawned Tokio task that ends when the returned
     /// `Channel` (and every clone) is dropped. `refresh` must be non-zero.
+    ///
+    /// Returns a tower-balanced `Channel` whose re-dials are polled only by
+    /// requests; prefer `connect_pooled*` (see PA-498 and the crate docs).
     pub async fn connect_discovered(&self, target_env: &str, refresh: Duration) -> Result<Channel> {
         self.connect_discovered_with(target_env, refresh, Arc::new(SystemResolver))
             .await
@@ -413,6 +440,9 @@ impl GrpcClientFactory {
     /// `refresh`) until it succeeds, and on that first success the per-address
     /// endpoints are inserted and the host-name seed is removed. Must be called
     /// inside a Tokio runtime, like `connect_lazy`.
+    ///
+    /// Returns a tower-balanced `Channel` whose re-dials are polled only by
+    /// requests; prefer `connect_pooled*` (see PA-498 and the crate docs).
     pub fn connect_discovered_lazy(&self, target_env: &str, refresh: Duration) -> Result<Channel> {
         self.connect_discovered_lazy_with(target_env, refresh, Arc::new(SystemResolver))
     }
