@@ -45,6 +45,8 @@
 //! `#[ignore]`d.
 
 mod discovery;
+#[cfg(test)]
+mod testkit;
 
 use std::collections::BTreeSet;
 use std::net::SocketAddr;
@@ -792,10 +794,7 @@ fn env_bool(key: &str, default: bool) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Mutex;
-
-    // Serialises tests that mutate process-global environment variables.
-    static ENV_LOCK: Mutex<()> = Mutex::new(());
+    use crate::testkit::ENV_LOCK;
 
     /// Go: `time.Duration(attempt*attempt*100) * time.Millisecond`
     /// (`app/grpc_pool.go:562`). At the default 100ms base a 3-attempt prewarm
