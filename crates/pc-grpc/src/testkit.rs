@@ -125,11 +125,25 @@ mod tests {
         Arc::new(Fixed(backends.iter().map(|b| b.addr).collect()))
     }
 
-    fn health_request() -> tonic::Request<HealthCheckRequest> {
+    /// Probe deadline of the stock characterization. Kept tight on purpose: its
+    /// failures are the dropped-unsent `Canceled` ones, not timeouts.
+    const STOCK_DEADLINE: Duration = Duration::from_millis(500);
+
+    /// Probe deadline of the pooled assertions. A pooled probe that finds its
+    /// connection closed waits for its own re-dial (TCP connect, HTTP/2
+    /// handshake through the bridge, then the RPC). That is a few ms on an idle
+    /// machine, but under CPU contention (a loaded CI runner, parallel builds)
+    /// 500 ms was occasionally not enough and the probe died with
+    /// `Cancelled: Timeout expired`, which is slowness, not a reconnect gap: a
+    /// real gap surfaces as `Canceled: connection closed`. The deadline is
+    /// there to bound a hung probe, not to measure speed, so it is generous.
+    const POOLED_DEADLINE: Duration = Duration::from_secs(2);
+
+    fn health_request(deadline: Duration) -> tonic::Request<HealthCheckRequest> {
         let mut req = tonic::Request::new(HealthCheckRequest {
             service: String::new(),
         });
-        crate::with_deadline(&mut req, Duration::from_millis(500));
+        crate::with_deadline(&mut req, deadline);
         req
     }
 
@@ -160,7 +174,7 @@ mod tests {
         for _ in 0..ROUNDS {
             tokio::time::sleep(GAP).await;
             if HealthClient::new(channel.clone())
-                .check(health_request())
+                .check(health_request(STOCK_DEADLINE))
                 .await
                 .is_err()
             {
@@ -204,7 +218,7 @@ mod tests {
         for round in 0..ROUNDS {
             tokio::time::sleep(GAP).await;
             HealthClient::new(pooled.clone())
-                .check(health_request())
+                .check(health_request(POOLED_DEADLINE))
                 .await
                 .unwrap_or_else(|e| panic!("probe {round} failed: {e:?}"));
         }
@@ -222,7 +236,7 @@ mod tests {
         let (a, mut b) = two_backends().await;
         let pooled = pooled_over(fixed(&[&a, &b]), Duration::from_secs(30)).await;
         HealthClient::new(pooled.clone())
-            .check(health_request())
+            .check(health_request(POOLED_DEADLINE))
             .await
             .expect("both pods up");
 
@@ -233,7 +247,7 @@ mod tests {
         let mut failed = 0;
         for _ in 0..10 {
             if HealthClient::new(pooled.clone())
-                .check(health_request())
+                .check(health_request(POOLED_DEADLINE))
                 .await
                 .is_err()
             {

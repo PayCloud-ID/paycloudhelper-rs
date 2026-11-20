@@ -67,6 +67,19 @@ recorded here with the reason.
   **Not fixed here:** aligning it changes behaviour for a consumer already
   pinned to `v1.0.2`, so the call is the helper owner's.
 
+## [1.7.1] - 2026-11-20
+
+### Fixed
+- `pc-grpc` test `pooled_channel_never_fails_a_probe_against_a_short_connection_timeout`
+  (and the other pooled tests in `testkit.rs`) flaked about 3 in 40 runs under
+  machine load, always as `Cancelled: Timeout expired` at the 500 ms probe
+  deadline. A pooled probe that finds its connection closed waits for its own
+  re-dial (connect, HTTP/2 handshake, RPC), and under CPU contention that
+  occasionally exceeded 500 ms. A real reconnect gap would show as
+  `Canceled: connection closed`, so this was test slowness, not a library bug.
+  Pooled probes now use a 2 s deadline; the ignored stock characterization keeps
+  its 500 ms deadline. Test-only change, no library behaviour changes.
+
 ## [1.7.0] - 2026-11-05
 
 ### Added
